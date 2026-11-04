@@ -2,24 +2,25 @@
 
 A local, file-based rich bridge for Apple Notes on macOS.
 
-Enables external agents (such as **Muse**) operating over paired-device text channels to create notes in Apple Notes with **real, native embedded images**, rich Markdown/HTML formatting, target folder placement, and result reporting.
+Enables external agents (such as **Muse**) operating over paired-device text channels to create notes in Apple Notes with **true native attachments (images, PDFs, documents)**, rich formatting (tables, checklists, blockquotes, typography), target folder placement, and result reporting.
 
 ---
 
 ## Why This Exists
 
-External agents connected over paired channels often have text-only Apple Notes integrations. macOS Notes automation does not support binary image transfer over simple text AppleScript invocations.
+External agents connected over paired channels often have text-only Apple Notes integrations. macOS Notes automation does not support binary image transfer over simple text AppleScript invocations, and WebKit URL loading inside Notes sandboxing fails on external `file://` URLs.
 
-This bridge solves the limitation by implementing a local, watched file inbox/outbox protocol:
-1. The external agent drops a manifest and base64-encoded image files into an inbox folder.
-2. A background watcher picks up the request, decodes images to temporary files in `/tmp`, and invokes native Apple Notes automation via JavaScript for Automation (JXA).
-3. Notes.app imports the images into its local CoreData store as native attachments.
-4. The temporary scratch files in `/tmp` are immediately removed.
-5. A result file with the new note's CoreData ID is written back to the outbox for the external agent to read.
-6. The request is moved to an archive directory to keep the inbox empty and clean.
+This bridge solves the limitation by using Apple Notes' native Cocoa scripting attachment handler:
+1. The external agent drops a manifest and base64-encoded image/document files into an inbox folder.
+2. A background watcher picks up the request and decodes attachments to temporary files in `/tmp`.
+3. The bridge invokes Apple Notes automation via AppleScript's native `make new attachment at theNote with data (POSIX file ...)` handler.
+4. Notes.app copies the files directly into its internal attachment store. The attachments render inline, support Quick Look, display high-resolution thumbnails, and sync across iCloud.
+5. Temporary scratch files in `/tmp` are immediately removed.
+6. A result receipt with the new note's CoreData ID is written back to the outbox for the external agent to read.
+7. The request is moved to an archive directory to keep the inbox empty and clean.
 
 **Design Constraints:**
-- **Stock macOS tools only**: Uses Python 3 standard library and system `osascript`/JXA. Zero third-party dependencies or pip packages.
+- **Stock macOS tools only**: Uses Python 3 standard library and system `osascript`. Zero third-party dependencies or pip packages.
 - **Zero network / completely local**: No servers, no network ports, nothing exposed.
 - **Deduplication**: Automatically deduplicates by request ID and SHA-256 content hash, preventing duplicate notes if a request is received multiple times.
 - **Intermediate file hygiene**: All temporary files are stored strictly under `/tmp` and cleaned up upon note creation.
@@ -46,10 +47,15 @@ By default, the bridge manages:
 ## Quick Start & Installation
 
 ### 1. Run Self-Test
-Verify that your Mac's Notes automation is ready and create an end-to-end test note with an embedded image:
+Verify that your Mac's Notes automation is ready and create an end-to-end test note with a real image and rich formatting:
 
 ```bash
 ./rich_notes_bridge.py test
+```
+
+To keep the test note in Notes.app for inspection:
+```bash
+./rich_notes_bridge.py test --keep
 ```
 
 ### 2. Install as a Background Service (launchd)
@@ -96,9 +102,9 @@ Write `~/.rich-notes-bridge/inbox/<request_id>.json`:
   "title": "System Architecture & Sketches",
   "folder": "Notes",
   "format": "markdown",
-  "body": "## System Overview\n\nHere is the whiteboard architecture:\n\n![Whiteboard](whiteboard.png)\n\nKey discussion points:\n- Fast local IPC\n- Native attachment persistence",
-  "images": {
-    "whiteboard.png": "iVBORw0KGgoAAAANSUhEUgAA..."
+  "body": "## System Overview\n\n### Action Items\n- [x] Verified native Apple Notes attachment handler\n- [ ] Ready for Muse paired device drop\n\n### Metrics Table\n| Component | Mechanism | Status |\n|---|---|---|\n| Attachment | `make new attachment with data` | VERIFIED |\n\n> Summary: Real attachments embedded and viewable in Quick Look.\n",
+  "attachments": {
+    "whiteboard.jpg": "<base64 encoded string>"
   }
 }
 ```
@@ -107,7 +113,8 @@ Write `~/.rich-notes-bridge/inbox/<request_id>.json`:
 
 Create `~/.rich-notes-bridge/inbox/<request_id>/`:
 - `manifest.json`: Title, body, target folder.
-- `whiteboard.png.b64`: Base64 text file of the image.
+- `whiteboard.jpg.b64`: Base64 text file of the image.
+- `report.pdf.b64`: Base64 text file of a document.
 
 ### Reading Results (Outbox)
 
@@ -117,14 +124,14 @@ The bridge writes `~/.rich-notes-bridge/outbox/<request_id>.json`:
 {
   "id": "req-20261103-01",
   "status": "success",
-  "note_id": "x-coredata://DD081B86-368A-4CBC-A6F5-CD822A89C8EE/ICNote/p9381",
+  "note_id": "x-coredata://DD081B86-368A-4CBC-A6F5-CD822A89C8EE/ICNote/p9450",
   "title": "System Architecture & Sketches",
   "folder": "Notes",
   "attachments_count": 1,
   "attachments": [
-    "whiteboard.png"
+    "whiteboard.jpg"
   ],
-  "processed_at": "2026-11-04T03:06:57.543874+00:00",
+  "processed_at": "2026-11-04T03:31:31.874177+00:00",
   "error": null
 }
 ```

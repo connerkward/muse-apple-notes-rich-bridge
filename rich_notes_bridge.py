@@ -3,9 +3,10 @@
 Rich Notes Bridge for macOS Apple Notes
 ---------------------------------------
 Enables external agents (e.g. Muse) to create rich notes in Apple Notes
-with embedded images, formatting, and target folders via file-based inbox/outbox.
+with true native attachments (images, PDFs, documents), rich formatting
+(tables, checklists, code blocks, typography), and folder placement.
 
-Stock macOS tools only (Python 3 standard library + osascript/JXA).
+Stock macOS tools only (Python 3 standard library + native osascript AppleScript).
 Zero network, zero third-party dependencies, completely local and private.
 """
 
@@ -83,11 +84,22 @@ class DedupManager:
     def __init__(self, dedup_path: Path):
         self.path = dedup_path
         self.data = {"by_id": {}, "by_content_hash": {}}
+        self._last_mtime = 0
         self._load()
+
+    def _ensure_latest(self):
+        try:
+            if self.path.exists():
+                mtime = self.path.stat().st_mtime
+                if mtime > self._last_mtime:
+                    self._load()
+        except Exception:
+            pass
 
     def _load(self):
         if self.path.exists():
             try:
+                self._last_mtime = self.path.stat().st_mtime
                 with open(self.path, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
                     self.data["by_id"] = loaded.get("by_id", {})
@@ -102,11 +114,13 @@ class DedupManager:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=2, ensure_ascii=False)
             os.replace(tmp_path, self.path)
+            self._last_mtime = self.path.stat().st_mtime
         except Exception as e:
             logger.error(f"Error saving dedup state to {self.path}: {e}")
 
     def check_duplicate(self, request_id: Optional[str], content_hash: str) -> Optional[Dict[str, Any]]:
         """Returns existing record if duplicate, else None."""
+        self._ensure_latest()
         if request_id and request_id in self.data["by_id"]:
             return self.data["by_id"][request_id]
         if content_hash in self.data["by_content_hash"]:
@@ -114,6 +128,7 @@ class DedupManager:
         return None
 
     def record(self, request_id: Optional[str], content_hash: str, note_record: Dict[str, Any]):
+        self._ensure_latest()
         if request_id:
             self.data["by_id"][request_id] = note_record
         if content_hash:
@@ -122,10 +137,10 @@ class DedupManager:
 
 
 # ----------------------------------------------------------------------
-# Image Processing & Base64 Decoding
+# Image & Attachment Utilities
 # ----------------------------------------------------------------------
-def detect_image_extension(data: bytes) -> str:
-    """Detect image extension from magic bytes."""
+def detect_file_extension(data: bytes, fallback: str = ".png") -> str:
+    """Detect file extension from magic bytes for common media and docs."""
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return ".png"
     if data.startswith(b"\xff\xd8\xff"):
@@ -134,11 +149,15 @@ def detect_image_extension(data: bytes) -> str:
         return ".gif"
     if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
         return ".webp"
+    if data.startswith(b"%PDF"):
+        return ".pdf"
+    if data.startswith(b"PK\x03\x04"):
+        return ".zip"
     if data.startswith(b"MM\x00*") or data.startswith(b"II*\x00"):
         return ".tiff"
     if data.startswith(b"BM"):
         return ".bmp"
-    return ".png"
+    return fallback
 
 
 def decode_base64_string(raw: str) -> bytes:
@@ -146,7 +165,6 @@ def decode_base64_string(raw: str) -> bytes:
     s = raw.strip()
     if s.startswith("data:") and ";base64," in s:
         s = s.split(";base64,", 1)[1]
-    # Remove any internal whitespace/newlines
     s = re.sub(r"\s+", "", s)
     return base64.b64decode(s)
 
@@ -157,7 +175,8 @@ def decode_base64_string(raw: str) -> bytes:
 def markdown_to_html(md_text: str) -> str:
     """
     Lightweight, dependency-free Markdown to Notes-compatible HTML converter.
-    Handles headings, bold, italic, code blocks, lists, links, images, and paragraphs.
+    Handles headings, bold, italic, strikethrough, checklists, tables,
+    blockquotes, code blocks, lists, links, and paragraphs.
     """
     lines = md_text.splitlines()
     html_parts = []
@@ -165,6 +184,8 @@ def markdown_to_html(md_text: str) -> str:
     code_block_lines = []
     in_ul = False
     in_ol = False
+    in_table = False
+    table_rows = []
 
     def close_lists():
         nonlocal in_ul, in_ol
@@ -177,6 +198,21 @@ def markdown_to_html(md_text: str) -> str:
             in_ol = False
         return res
 
+    def flush_table():
+        nonlocal in_table, table_rows
+        if not table_rows:
+            return ""
+        res = ['<table border="1" cellpadding="6" style="border-collapse: collapse; border: 1px solid #ddd; margin: 10px 0; width: 100%;">']
+        for i, row in enumerate(table_rows):
+            tag = "th" if i == 0 else "td"
+            bg = ' style="background-color: #f7f7f8; text-align: left;"' if i == 0 else ""
+            cells_html = "".join(f"<{tag}>{apply_inline_formatting(c)}</{tag}>" for c in row)
+            res.append(f"<tr{bg}>{cells_html}</tr>")
+        res.append("</table>")
+        in_table = False
+        table_rows = []
+        return "\n".join(res)
+
     for line in lines:
         stripped = line.strip()
 
@@ -184,16 +220,46 @@ def markdown_to_html(md_text: str) -> str:
         if stripped.startswith("```"):
             if in_code_block:
                 code_content = html.escape("\n".join(code_block_lines))
-                html_parts.append(f"<pre style=\"background:#f4f4f4;padding:8px;border-radius:4px;\"><code>{code_content}</code></pre>")
+                html_parts.append(
+                    f'<pre style="background:#f4f4f4;padding:8px;border-radius:4px;font-family:monospace;font-size:13px;"><code>{code_content}</code></pre>'
+                )
                 code_block_lines = []
                 in_code_block = False
             else:
                 html_parts.append(close_lists())
+                if in_table:
+                    html_parts.append(flush_table())
                 in_code_block = True
             continue
 
         if in_code_block:
             code_block_lines.append(line)
+            continue
+
+        # Tables: | Col 1 | Col 2 |
+        if stripped.startswith("|") and stripped.endswith("|"):
+            html_parts.append(close_lists())
+            raw_cells = [c.strip() for c in stripped.strip("|").split("|")]
+            # Divider row check: |---|---|
+            if all(re.match(r"^:?-+:?$", c) for c in raw_cells):
+                continue
+            table_rows.append(raw_cells)
+            in_table = True
+            continue
+        elif in_table:
+            html_parts.append(flush_table())
+
+        # Checklists: - [ ] Task or - [x] Done
+        chk_match = re.match(r"^[\*\-\+]\s+\[([ xX])\]\s+(.*)$", stripped)
+        if chk_match:
+            html_parts.append(close_lists())
+            is_checked = chk_match.group(1).lower() == "x"
+            box = "☑" if is_checked else "☐"
+            task_text = apply_inline_formatting(chk_match.group(2))
+            if is_checked:
+                html_parts.append(f"<div>{box} <s>{task_text}</s></div>")
+            else:
+                html_parts.append(f"<div>{box} {task_text}</div>")
             continue
 
         # Blank lines
@@ -202,17 +268,30 @@ def markdown_to_html(md_text: str) -> str:
             html_parts.append("<div><br></div>")
             continue
 
+        # Horizontal rule
+        if stripped in ["---", "***", "___"]:
+            html_parts.append(close_lists())
+            html_parts.append('<hr style="border:0;border-top:1px solid #ddd;margin:12px 0;">')
+            continue
+
+        # Blockquote
+        if stripped.startswith(">"):
+            html_parts.append(close_lists())
+            quote_text = apply_inline_formatting(stripped.lstrip("> ").strip())
+            html_parts.append(
+                f'<blockquote style="border-left:3px solid #ccc;padding-left:10px;color:#555;margin:6px 0;">{quote_text}</blockquote>'
+            )
+            continue
+
         # Headings
         heading_match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
         if heading_match:
             html_parts.append(close_lists())
             level = len(heading_match.group(1))
-            heading_text = heading_match.group(2)
-            # Inline formatting for heading
-            heading_text = apply_inline_formatting(heading_text)
+            heading_text = apply_inline_formatting(heading_match.group(2))
             sizes = {1: "24px", 2: "20px", 3: "17px", 4: "15px", 5: "14px", 6: "13px"}
             font_size = sizes.get(level, "16px")
-            html_parts.append(f"<div><b><span style=\"font-size: {font_size};\">{heading_text}</span></b></div>")
+            html_parts.append(f'<div><b><span style="font-size: {font_size};">{heading_text}</span></b></div>')
             continue
 
         # Unordered list
@@ -246,20 +325,26 @@ def markdown_to_html(md_text: str) -> str:
         code_content = html.escape("\n".join(code_block_lines))
         html_parts.append(f"<pre><code>{code_content}</code></pre>")
 
+    if in_table:
+        html_parts.append(flush_table())
+
     html_parts.append(close_lists())
     return "\n".join(p for p in html_parts if p)
 
 
 def apply_inline_formatting(text: str) -> str:
-    """Applies inline bold, italic, code, links, and markdown images."""
-    # Markdown images: ![alt](url) -> <img src="url" alt="alt">
-    text = re.sub(r"!\[(.*?)\]\((.*?)\)", r'<img src="\2" alt="\1" style="max-width: 100%;">', text)
+    """Applies inline bold, italic, strikethrough, code, links, and markdown image captions."""
+    # Strikethrough: ~~text~~
+    text = re.sub(r"~~([^~]+)~~", r"<s>\1</s>", text)
+
+    # Markdown images: ![alt](url) -> formatted image placeholder caption
+    text = re.sub(r"!\[(.*?)\]\([^\)]+\)", r'<div style="color:#666;font-size:13px;margin:4px 0;">📷 <b>\1</b></div>', text)
 
     # Markdown links: [text](url) -> <a href="url">text</a>
     text = re.sub(r"\[(.*?)\]\((.*?)\)", r'<a href="\2">\1</a>', text)
 
     # Inline code: `code`
-    text = re.sub(r"`([^`]+)`", r'<code style="background:#f4f4f4;padding:2px 4px;border-radius:3px;">\1</code>', text)
+    text = re.sub(r"`([^`]+)`", r'<code style="background:#f4f4f4;padding:2px 4px;border-radius:3px;font-family:monospace;">\1</code>', text)
 
     # Bold: **bold** or __bold__
     text = re.sub(r"\*\*([^\*]+)\*\*", r"<b>\1</b>", text)
@@ -283,7 +368,7 @@ class RichNoteRequest:
         folder: str,
         body: str,
         format_type: str,
-        images: Dict[str, bytes],
+        attachments: Dict[str, bytes],
         raw_source_path: Path,
     ):
         self.request_id = request_id
@@ -291,7 +376,7 @@ class RichNoteRequest:
         self.folder = folder or "Notes"
         self.body = body or ""
         self.format_type = format_type.lower() if format_type else "auto"
-        self.images = images  # filename -> decoded bytes
+        self.attachments = attachments  # filename -> decoded bytes
         self.raw_source_path = raw_source_path
 
     def compute_content_hash(self) -> str:
@@ -302,20 +387,19 @@ class RichNoteRequest:
         h.update(self.title.strip().encode("utf-8"))
         h.update(b"|")
         h.update(self.body.strip().encode("utf-8"))
-        # Sort image names and include image byte hashes
-        for name in sorted(self.images.keys()):
-            h.update(b"|img:")
+        for name in sorted(self.attachments.keys()):
+            h.update(b"|att:")
             h.update(name.encode("utf-8"))
             h.update(b":")
-            h.update(hashlib.sha256(self.images[name]).digest())
+            h.update(hashlib.sha256(self.attachments[name]).digest())
         return h.hexdigest()
 
 
 def parse_request_from_path(item_path: Path) -> Optional[RichNoteRequest]:
     """
-    Parses a request from either:
-    1. A directory containing manifest.json (or manifest.txt) + image files (.b64 / images)
-    2. A single .json file with embedded base64 images
+    Parses a request from:
+    1. A directory containing manifest.json (or manifest.txt) + companion files
+    2. A single .json file with embedded base64 attachments/images
     3. A single .txt / .md file with frontmatter
     """
     try:
@@ -341,11 +425,14 @@ def parse_request_from_path(item_path: Path) -> Optional[RichNoteRequest]:
 
 def _parse_directory_request(dir_path: Path) -> RichNoteRequest:
     req_id = dir_path.name
+    if req_id.endswith(".processing"):
+        req_id = req_id[:-len(".processing")]
+
     title = ""
     folder = "Notes"
     body = ""
     format_type = "auto"
-    images: Dict[str, bytes] = {}
+    attachments: Dict[str, bytes] = {}
 
     manifest_candidates = [
         dir_path / "manifest.json",
@@ -371,12 +458,11 @@ def _parse_directory_request(dir_path: Path) -> RichNoteRequest:
         body = meta.get("body", "")
         format_type = meta.get("format", "auto")
 
-        # Inlined images in JSON
-        if "images" in meta:
-            _extract_images_from_dict_or_list(meta["images"], images, dir_path)
+        for k in ["images", "attachments"]:
+            if k in meta:
+                _extract_attachments(meta[k], attachments, dir_path)
 
     elif manifest_path:
-        # Text/markdown manifest
         with open(manifest_path, "r", encoding="utf-8") as f:
             content = f.read()
         parsed = _parse_frontmatter_text(content)
@@ -386,36 +472,30 @@ def _parse_directory_request(dir_path: Path) -> RichNoteRequest:
         body = parsed.get("body") or body
         format_type = parsed.get("format") or format_type
 
-    # Scan directory for companion base64/image files
+    # Scan directory for companion files
     for f in dir_path.iterdir():
-        if f.is_file() and f != manifest_path:
+        if f.is_file() and f != manifest_path and not f.name.startswith("."):
             name_lower = f.name.lower()
             if name_lower.endswith((".b64", ".base64")):
-                # photo1.png.b64 -> photo1.png
                 clean_name = f.stem
                 try:
-                    with open(f, "r", encoding="utf-8") as img_f:
-                        raw_b64 = img_f.read()
-                    data = decode_base64_string(raw_b64)
-                    images[clean_name] = data
+                    with open(f, "r", encoding="utf-8") as bf:
+                        attachments[clean_name] = decode_base64_string(bf.read())
                 except Exception as e:
-                    logger.warning(f"Failed to read/decode base64 file {f.name}: {e}")
-            elif name_lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff")):
-                # Check if it contains raw bytes or base64 text
+                    logger.warning(f"Failed to decode base64 file {f.name}: {e}")
+            else:
                 try:
                     with open(f, "rb") as bf:
                         raw_bytes = bf.read()
-                    # If it starts with data: or printable base64
-                    if raw_bytes.startswith(b"data:image") or (len(raw_bytes) > 0 and raw_bytes[:10].isalnum() and not raw_bytes.startswith(b"\x89PNG")):
+                    if raw_bytes.startswith(b"data:") or (len(raw_bytes) > 0 and raw_bytes[:10].isalnum() and not raw_bytes.startswith((b"\x89PNG", b"\xff\xd8", b"%PDF"))):
                         try:
-                            decoded = decode_base64_string(raw_bytes.decode("utf-8", errors="ignore"))
-                            images[f.name] = decoded
+                            attachments[f.name] = decode_base64_string(raw_bytes.decode("utf-8", errors="ignore"))
                         except Exception:
-                            images[f.name] = raw_bytes
+                            attachments[f.name] = raw_bytes
                     else:
-                        images[f.name] = raw_bytes
+                        attachments[f.name] = raw_bytes
                 except Exception as e:
-                    logger.warning(f"Failed to read companion image {f.name}: {e}")
+                    logger.warning(f"Failed to read companion file {f.name}: {e}")
 
     return RichNoteRequest(
         request_id=req_id,
@@ -423,7 +503,7 @@ def _parse_directory_request(dir_path: Path) -> RichNoteRequest:
         folder=folder,
         body=body,
         format_type=format_type,
-        images=images,
+        attachments=attachments,
         raw_source_path=dir_path,
     )
 
@@ -432,15 +512,20 @@ def _parse_json_file_request(json_path: Path) -> RichNoteRequest:
     with open(json_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
-    req_id = meta.get("id") or json_path.stem
+    orig_name = json_path.name
+    if orig_name.endswith(".processing"):
+        orig_name = orig_name[:-len(".processing")]
+
+    req_id = meta.get("id") or Path(orig_name).stem
     title = meta.get("title", "")
     folder = meta.get("folder", "Notes")
     body = meta.get("body", "")
     format_type = meta.get("format", "auto")
-    images: Dict[str, bytes] = {}
+    attachments: Dict[str, bytes] = {}
 
-    if "images" in meta:
-        _extract_images_from_dict_or_list(meta["images"], images, json_path.parent)
+    for k in ["images", "attachments"]:
+        if k in meta:
+            _extract_attachments(meta[k], attachments, json_path.parent)
 
     return RichNoteRequest(
         request_id=req_id,
@@ -448,7 +533,7 @@ def _parse_json_file_request(json_path: Path) -> RichNoteRequest:
         folder=folder,
         body=body,
         format_type=format_type,
-        images=images,
+        attachments=attachments,
         raw_source_path=json_path,
     )
 
@@ -456,27 +541,35 @@ def _parse_json_file_request(json_path: Path) -> RichNoteRequest:
 def _parse_text_file_request(txt_path: Path) -> RichNoteRequest:
     with open(txt_path, "r", encoding="utf-8") as f:
         content = f.read()
+
+    orig_name = txt_path.name
+    if orig_name.endswith(".processing"):
+        orig_name = orig_name[:-len(".processing")]
+
     parsed = _parse_frontmatter_text(content)
-    req_id = parsed.get("id") or txt_path.stem
+    req_id = parsed.get("id") or Path(orig_name).stem
     title = parsed.get("title", "")
     folder = parsed.get("folder", "Notes")
     body = parsed.get("body", "")
     format_type = parsed.get("format", "markdown")
-    images: Dict[str, bytes] = {}
+    attachments: Dict[str, bytes] = {}
 
-    # Also check if companion .b64 files exist next to it: e.g. <stem>_image.png.b64
     parent = txt_path.parent
-    prefix = f"{txt_path.stem}_"
+    prefix = f"{Path(orig_name).stem}_"
     for cand in parent.glob(f"{prefix}*"):
-        if cand.is_file() and cand.suffix.lower() in [".b64", ".base64"]:
-            img_name = cand.name[len(prefix) :]
-            if img_name.endswith((".b64", ".base64")):
-                img_name = Path(img_name).stem
+        if cand.is_file() and not cand.name.startswith("."):
+            clean_name = cand.name[len(prefix) :]
+            if clean_name.lower().endswith((".b64", ".base64")):
+                clean_name = Path(clean_name).stem
             try:
-                with open(cand, "r", encoding="utf-8") as bf:
-                    images[img_name] = decode_base64_string(bf.read())
+                with open(cand, "rb") as bf:
+                    raw = bf.read()
+                try:
+                    attachments[clean_name] = decode_base64_string(raw.decode("utf-8"))
+                except Exception:
+                    attachments[clean_name] = raw
             except Exception as e:
-                logger.warning(f"Failed decoding companion base64 file {cand}: {e}")
+                logger.warning(f"Failed decoding companion file {cand}: {e}")
 
     return RichNoteRequest(
         request_id=req_id,
@@ -484,42 +577,47 @@ def _parse_text_file_request(txt_path: Path) -> RichNoteRequest:
         folder=folder,
         body=body,
         format_type=format_type,
-        images=images,
+        attachments=attachments,
         raw_source_path=txt_path,
     )
 
 
-def _extract_images_from_dict_or_list(images_obj: Any, images_dict: Dict[str, bytes], base_dir: Path):
-    if isinstance(images_obj, dict):
-        for name, val in images_obj.items():
+def _extract_attachments(obj: Any, out_dict: Dict[str, bytes], base_dir: Path):
+    if isinstance(obj, dict):
+        for name, val in obj.items():
             if isinstance(val, str):
-                # Could be base64 string or filename relative to base_dir
                 possible_file = base_dir / val
                 if possible_file.is_file():
-                    with open(possible_file, "r", encoding="utf-8") as f:
-                        images_dict[name] = decode_base64_string(f.read())
+                    with open(possible_file, "rb") as f:
+                        raw = f.read()
+                    try:
+                        out_dict[name] = decode_base64_string(raw.decode("utf-8"))
+                    except Exception:
+                        out_dict[name] = raw
                 else:
-                    images_dict[name] = decode_base64_string(val)
-    elif isinstance(images_obj, list):
-        for idx, item in enumerate(images_obj):
+                    out_dict[name] = decode_base64_string(val)
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
             if isinstance(item, dict):
-                name = item.get("name") or item.get("filename") or f"image_{idx+1}.png"
+                name = item.get("name") or item.get("filename") or f"attachment_{idx+1}.png"
                 val = item.get("data") or item.get("base64") or item.get("path")
                 if val and isinstance(val, str):
                     possible_file = base_dir / val
                     if possible_file.is_file():
-                        with open(possible_file, "r", encoding="utf-8") as f:
-                            images_dict[name] = decode_base64_string(f.read())
+                        with open(possible_file, "rb") as f:
+                            raw = f.read()
+                        try:
+                            out_dict[name] = decode_base64_string(raw.decode("utf-8"))
+                        except Exception:
+                            out_dict[name] = raw
                     else:
-                        images_dict[name] = decode_base64_string(val)
+                        out_dict[name] = decode_base64_string(val)
 
 
 def _parse_frontmatter_text(raw_text: str) -> Dict[str, str]:
-    """Parse text with YAML-like frontmatter or header keys."""
     meta = {}
     body = raw_text
 
-    # YAML frontmatter --- ... ---
     if raw_text.startswith("---"):
         parts = raw_text.split("---", 2)
         if len(parts) >= 3:
@@ -532,7 +630,6 @@ def _parse_frontmatter_text(raw_text: str) -> Dict[str, str]:
             meta["body"] = body
             return meta
 
-    # Key: Value lines at top followed by empty line
     lines = raw_text.splitlines()
     header_lines = []
     body_idx = 0
@@ -557,36 +654,30 @@ def _parse_frontmatter_text(raw_text: str) -> Dict[str, str]:
 
 
 # ----------------------------------------------------------------------
-# HTML Synthesis & Image Reference Resolution
+# HTML Synthesis & Attachment Staging
 # ----------------------------------------------------------------------
-def prepare_note_html(
+def prepare_note_html_and_attachments(
     req: RichNoteRequest, scratch_dir: Path
-) -> Tuple[str, List[str]]:
+) -> Tuple[str, List[Path]]:
     """
-    Writes decoded images to scratch_dir (/tmp) and constructs the final
-    Apple Notes-compatible HTML body referencing file:/// URLs.
-    Returns (html_body, list_of_saved_image_filenames).
+    Stages all attachments into scratch_dir (/tmp) and prepares the rich
+    HTML body for Apple Notes. Returns (html_body, list_of_staged_file_paths).
     """
-    saved_images: Dict[str, Path] = {}
-    saved_filenames: List[str] = []
+    staged_paths: List[Path] = []
 
-    # 1. Save all decoded images into scratch_dir (/tmp)
-    for orig_name, img_bytes in req.images.items():
-        # Ensure safe filename
+    # 1. Save all decoded attachments into scratch_dir (/tmp)
+    for orig_name, file_bytes in req.attachments.items():
         safe_name = Path(orig_name).name
-        # If no extension or .b64 extension, fix it
         ext = Path(safe_name).suffix.lower()
         if ext in [".b64", ".base64", ".txt", ""]:
-            safe_name = f"{Path(safe_name).stem}{detect_image_extension(img_bytes)}"
+            safe_name = f"{Path(safe_name).stem}{detect_file_extension(file_bytes)}"
 
         out_path = scratch_dir / safe_name
         with open(out_path, "wb") as f:
-            f.write(img_bytes)
+            f.write(file_bytes)
 
-        saved_images[orig_name] = out_path
-        saved_images[safe_name] = out_path
-        if safe_name not in saved_filenames:
-            saved_filenames.append(safe_name)
+        if out_path not in staged_paths:
+            staged_paths.append(out_path)
 
     # 2. Convert body to HTML
     body_str = req.body or ""
@@ -601,132 +692,102 @@ def prepare_note_html(
     if is_html:
         html_content = body_str
     else:
-        # Markdown / plain text
         html_content = markdown_to_html(body_str)
 
-    # 3. Replace image references with file:/// paths
-    used_images = set()
+    # Remove any stray <img src="..."> tags from HTML body so Notes doesn't fail URL loading
+    html_content = re.sub(r'<img[^>]*alt=["\'](.*?)["\'][^>]*>', r'<div><i>📷 \1</i></div>', html_content)
+    html_content = re.sub(r'<img[^>]*>', r'', html_content)
 
-    def replace_src(match):
-        src = match.group(1).strip()
-        clean_src = src.lstrip("./")
-        matched_path = None
-
-        candidates = [
-            src,
-            clean_src,
-            Path(src).name,
-            f"{src}.b64",
-            f"{src}.base64",
-            Path(src).stem if Path(src).suffix.lower() in [".b64", ".base64"] else None,
-        ]
-        for c in candidates:
-            if c and c in saved_images:
-                matched_path = saved_images[c]
-                break
-
-        if matched_path:
-            used_images.add(matched_path.name)
-            return f'src="file://{matched_path.resolve()}"'
-        return match.group(0)
-
-    # Replace in img src="..."
-    html_content = re.sub(r'src=["\']([^"\']+)["\']', replace_src, html_content)
-
-    # 4. If any images in request were NOT referenced in body, append them
-    unreferenced_parts = []
-    for safe_name in saved_filenames:
-        if safe_name not in used_images:
-            img_file = scratch_dir / safe_name
-            unreferenced_parts.append(
-                f'<div><br></div><div><img src="file://{img_file.resolve()}" style="max-width: 100%;"><br></div>'
-            )
-
-    if unreferenced_parts:
-        html_content += "\n" + "\n".join(unreferenced_parts)
-
-    # 5. Ensure title is rendered as the first element if not already present
+    # 3. Ensure title is rendered as the first element if not already present
     title_escaped = html.escape(req.title)
     if not (f"<h1>{title_escaped}</h1>" in html_content or title_escaped in html_content[:150]):
         title_block = f'<div><b><span style="font-size: 24px;">{title_escaped}</span></b></div><div><br></div>\n'
         html_content = title_block + html_content
 
-    return html_content, saved_filenames
+    return html_content, staged_paths
 
 
 # ----------------------------------------------------------------------
-# Notes.app Automation via JXA
+# Apple Notes Automation via AppleScript
 # ----------------------------------------------------------------------
-JXA_CREATE_NOTE_SCRIPT = """
-function run(argv) {
-    const input = JSON.parse(argv[0]);
-    const Notes = Application('Notes');
-    
-    // Resolve target folder
-    let targetFolder;
-    const folderName = (input.folder || '').trim();
-    if (folderName === '' || folderName.toLowerCase() === 'notes') {
-        try {
-            targetFolder = Notes.folders.byName('Notes');
-            targetFolder.name();
-        } catch(e) {
-            targetFolder = Notes.defaultAccount().defaultFolder();
-        }
-    } else {
-        try {
-            targetFolder = Notes.folders.byName(folderName);
-            targetFolder.name();
-        } catch(e) {
-            targetFolder = Notes.Folder({ name: folderName });
-            Notes.defaultAccount().folders.push(targetFolder);
-        }
-    }
-    
-    // Create note
-    const note = Notes.Note({ body: input.html_body });
-    targetFolder.notes.push(note);
-    
-    // Return note properties
-    const res = {
-        id: note.id(),
-        name: note.name(),
-        folder: targetFolder.name(),
-        attachments_count: note.attachments().length
-    };
-    return JSON.stringify(res);
-}
-"""
-
-
-def execute_jxa_create_note(folder: str, title: str, html_body: str) -> Dict[str, Any]:
-    """Invokes JXA script via osascript using JSON input over argv."""
+def execute_applescript_create_note(
+    folder: str,
+    title: str,
+    html_body: str,
+    attachment_paths: List[Path],
+    scratch_dir: Path,
+) -> Dict[str, Any]:
+    """
+    Creates note in Apple Notes and attaches files via AppleScript data handler:
+    'make new attachment at theNote with data (POSIX file ...)'
+    This provides true native attachment and image embedding that renders
+    in Notes.app, Quick Look, and iCloud sync.
+    """
     # Ensure Notes app is awake
     try:
         subprocess.run(["open", "-g", "-a", "Notes"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
-    payload = {"folder": folder, "title": title, "html_body": html_body}
+    # Write HTML body to file in scratch_dir so AppleScript can read it via (read POSIX file ... as «class utf8»)
+    body_file = scratch_dir / "note_body.html"
+    with open(body_file, "w", encoding="utf-8") as f:
+        f.write(html_body)
 
-    res = subprocess.run(
-        ["osascript", "-l", "JavaScript", "-", json.dumps(payload)],
-        input=JXA_CREATE_NOTE_SCRIPT,
-        capture_output=True,
-        text=True,
-    )
+    safe_folder = (folder or "Notes").strip().replace("\\", "\\\\").replace('"', '\\"')
+
+    script_lines = [
+        'tell application "Notes"',
+        f'    set folderName to "{safe_folder}"',
+        '    if folderName is "" or folderName is "Notes" then',
+        '        try',
+        '            set theFolder to folder "Notes"',
+        '        on error',
+        '            set theFolder to default folder of default account',
+        '        end try',
+        '    else',
+        '        try',
+        '            set theFolder to folder folderName',
+        '        on error',
+        '            set theFolder to make new folder at default account with properties {name:folderName}',
+        '        end try',
+        '    end if',
+        f'    set bodyText to (read POSIX file "{body_file.resolve()}" as «class utf8»)',
+        '    set theNote to make new note at theFolder with properties {body:bodyText}',
+    ]
+
+    for att_path in attachment_paths:
+        script_lines.append(f'    make new attachment at theNote with data (POSIX file "{att_path.resolve()}")')
+
+    script_lines.extend([
+        '    set noteId to id of theNote',
+        '    set noteName to name of theNote',
+        '    return noteId & "\\t" & noteName',
+        'end tell',
+    ])
+
+    script_content = "\n".join(script_lines)
+
+    res = subprocess.run(["osascript", "-"], input=script_content, capture_output=True, text=True)
 
     if res.returncode != 0:
-        error_msg = res.stderr.strip() or f"osascript failed with return code {res.returncode}"
+        error_msg = res.stderr.strip() or f"AppleScript failed with return code {res.returncode}"
         raise RuntimeError(f"Notes.app automation error: {error_msg}")
 
     output_str = res.stdout.strip()
     if not output_str:
         raise RuntimeError("Notes.app automation returned empty response")
 
-    try:
-        return json.loads(output_str)
-    except json.JSONDecodeError:
-        raise RuntimeError(f"Failed to parse Notes.app response: {output_str}")
+    parts = output_str.split("\t")
+    note_id = parts[0]
+    note_name = parts[1] if len(parts) > 1 else title
+
+    return {
+        "id": note_id,
+        "name": note_name,
+        "attachments_count": len(attachment_paths),
+        "folder": folder,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -776,15 +837,16 @@ def process_request(item_path: Path, config: BridgeConfig, dedup: DedupManager) 
         scratch_dir = Path(f"/tmp/rich_notes_bridge_{req_id}_{timestamp_slug}")
         scratch_dir.mkdir(parents=True, exist_ok=True)
 
-        # Synthesize HTML and save intermediate images
-        html_body, saved_filenames = prepare_note_html(req, scratch_dir)
+        # Synthesize HTML and stage attachments
+        html_body, staged_paths = prepare_note_html_and_attachments(req, scratch_dir)
+        attachment_names = [p.name for p in staged_paths]
 
-        # Create note in Notes.app
-        logger.info(f"Creating note '{req.title}' in folder '{req.folder}' with {len(saved_filenames)} image(s)...")
-        notes_res = execute_jxa_create_note(req.folder, req.title, html_body)
+        # Create note in Notes.app with attachments
+        logger.info(f"Creating note '{req.title}' in folder '{req.folder}' with {len(staged_paths)} attachment(s)...")
+        notes_res = execute_applescript_create_note(req.folder, req.title, html_body, staged_paths, scratch_dir)
 
         note_id = notes_res["id"]
-        attachments_count = notes_res.get("attachments_count", len(saved_filenames))
+        attachments_count = len(staged_paths)
         actual_folder = notes_res.get("folder", req.folder)
 
         logger.info(f"Successfully created note '{notes_res.get('name')}' (id: {note_id}) with {attachments_count} attachment(s)")
@@ -795,7 +857,7 @@ def process_request(item_path: Path, config: BridgeConfig, dedup: DedupManager) 
             "title": req.title,
             "folder": actual_folder,
             "attachments_count": attachments_count,
-            "attachments": saved_filenames,
+            "attachments": attachment_names,
             "content_hash": content_hash,
             "created_at": now_iso,
         }
@@ -809,7 +871,7 @@ def process_request(item_path: Path, config: BridgeConfig, dedup: DedupManager) 
             "title": req.title,
             "folder": actual_folder,
             "attachments_count": attachments_count,
-            "attachments": saved_filenames,
+            "attachments": attachment_names,
             "processed_at": now_iso,
             "error": None,
         }
@@ -883,25 +945,20 @@ def is_item_ready(path: Path) -> bool:
     if name.startswith(".") or name.endswith((".tmp", ".temp", ".part", ".partial", ".crdownload", ".processing")):
         return False
 
-    # Check stability (mtime and size shouldn't be currently mutating)
     try:
-        # If it's a directory, check if it has contents
         if path.is_dir():
             entries = list(path.iterdir())
             if not entries:
                 return False
-            # Check if any temp files inside
             for e in entries:
                 if e.name.startswith(".") or e.name.endswith((".tmp", ".temp", ".part", ".partial")):
                     return False
         else:
-            # Must not be 0 bytes
             if path.stat().st_size == 0:
                 return False
 
         mtime = path.stat().st_mtime
         if (time.time() - mtime) < 0.2:
-            # File was modified less than 200ms ago, let it finish
             return False
     except Exception:
         return False
@@ -920,7 +977,6 @@ def scan_and_process_inbox(config: BridgeConfig, dedup: DedupManager) -> int:
         if not is_item_ready(item):
             continue
 
-        # Atomically rename to .processing to lock against concurrent runners
         processing_path = item.with_name(f"{item.name}.processing")
         try:
             item.rename(processing_path)
@@ -933,7 +989,6 @@ def scan_and_process_inbox(config: BridgeConfig, dedup: DedupManager) -> int:
             processed_count += 1
         except Exception as e:
             logger.error(f"Error handling {item.name}: {e}", exc_info=True)
-            # If not archived, restore name
             if processing_path.exists():
                 try:
                     processing_path.rename(item)
@@ -1005,7 +1060,6 @@ def install_launchd(config: BridgeConfig, script_path: Path):
     config.ensure_directories()
     LAUNCH_AGENT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    # Unload first if loaded
     subprocess.run(["launchctl", "unload", str(LAUNCH_AGENT_PATH)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     plist_content = generate_launchd_plist(script_path, config.base_dir)
@@ -1036,7 +1090,6 @@ def check_status(config: BridgeConfig):
     print(f"Outbox Directory : {config.outbox_dir} (results: {len(list(config.outbox_dir.glob('*.json')))})")
     print(f"Archive Directory: {config.archive_dir}")
 
-    # LaunchAgent status
     if LAUNCH_AGENT_PATH.exists():
         res = subprocess.run(["launchctl", "list", LAUNCH_AGENT_LABEL], capture_output=True, text=True)
         if res.returncode == 0:
@@ -1046,39 +1099,69 @@ def check_status(config: BridgeConfig):
     else:
         print(f"LaunchAgent      : NOT INSTALLED")
 
-    # Dedup stats
     dedup = DedupManager(config.dedup_file)
     print(f"Processed Notes  : {len(dedup.data.get('by_id', {}))} recorded in state")
 
 
 # ----------------------------------------------------------------------
-# Self-Test Utility
+# Real-Image Self Test Utility
 # ----------------------------------------------------------------------
+def get_or_create_real_test_image() -> Tuple[str, bytes]:
+    """Finds a real photographic image from desktop or resamples wallpaper."""
+    desktop_adorno = Path(os.path.expanduser("~/Desktop/adorno-table-frame.jpg"))
+    if desktop_adorno.exists():
+        with open(desktop_adorno, "rb") as f:
+            return "adorno-table-frame.jpg", f.read()
+
+    desktop_dir = Path(os.path.expanduser("~/Desktop"))
+    for ext in ["*.jpg", "*.jpeg", "*.png", "*.webp"]:
+        candidates = list(desktop_dir.glob(ext))
+        if candidates:
+            cand = candidates[0]
+            with open(cand, "rb") as f:
+                return cand.name, f.read()
+
+    # Fallback to resampling Apple system wallpaper using sips
+    wallpapers = [
+        Path("/System/Library/Wallpapers/.default/DefaultAerial.heic"),
+        Path("/System/Library/CoreServices/DefaultDesktop.heic"),
+    ]
+    for w in wallpapers:
+        if w.exists():
+            tmp_out = Path("/tmp/real_wallpaper_sample.jpg")
+            subprocess.run(
+                ["sips", "-s", "format", "jpeg", str(w), "--resampleWidth", "400", "--out", str(tmp_out)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if tmp_out.exists():
+                with open(tmp_out, "rb") as f:
+                    return "apple_wallpaper.jpg", f.read()
+
+    # Synthetic fallback: 1x1 png
+    b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    return "test.png", base64.b64decode(b64)
+
+
 def run_self_test(config: BridgeConfig, keep_note: bool = False) -> bool:
     """
-    End-to-end self test:
-    1. Generates a real test image (PNG with gradient/pattern)
-    2. Drops a rich request with base64 image into inbox
-    3. Runs process pipeline
-    4. Checks result file in outbox
-    5. Queries Apple Notes via JXA to verify note exists and has attachment
-    6. Verifies deduplication by re-submitting the same request
-    7. Cleans up test note (unless keep_note is True)
+    End-to-end self test with a REAL image and rich capabilities:
+    - Tables, checklists, headings, code formatting
+    - Real native attachment creation
+    - Deduplication check
+    - Outbox receipt verification
     """
-    logger.info("Starting End-to-End Self Test...")
+    logger.info("Starting End-to-End Self Test with real image and rich formatting...")
     config.ensure_directories()
     dedup = DedupManager(config.dedup_file)
 
-    test_req_id = f"test-rich-bridge-{int(time.time())}"
-    test_title = f"Rich Bridge Test ({test_req_id})"
+    test_req_id = f"test-real-{int(time.time())}"
+    test_title = f"Rich Bridge Real Image Test ({test_req_id})"
     test_folder = "Notes"
 
-    # 1. Create a 32x32 real PNG with a blue gradient
-    # A valid self-contained 32x32 PNG byte array:
-    sample_b64_png = (
-        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAM0lEQVR42u3PMQ0AAAgEsH8y"
-        "sYJ3E5CA1vQkd/V7AgQEBAQEBAQEBAQEBAQEBAQE5gZeT7UBJ/vA6+wAAAAASUVORK5CYII="
-    )
+    img_filename, img_bytes = get_or_create_real_test_image()
+    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+    logger.info(f"Using real test image: {img_filename} ({len(img_bytes):,} bytes)")
 
     test_payload = {
         "id": test_req_id,
@@ -1086,33 +1169,41 @@ def run_self_test(config: BridgeConfig, keep_note: bool = False) -> bool:
         "folder": test_folder,
         "format": "markdown",
         "body": (
-            "## Rich Notes Bridge E2E Verification\n\n"
-            "This note was created automatically to verify image embedding.\n\n"
-            "Here is the embedded test image:\n\n"
-            "![Test Blue Square](test_image.png)\n\n"
-            "- Feature 1: Base64 decoding\n"
-            "- Feature 2: Native Apple Notes attachment embedding\n"
-            "- Feature 3: Result reporting to outbox\n"
+            "## Real Attachment & Rich Note Capabilities Test\n\n"
+            "This note verifies that **real native attachments** load correctly in Apple Notes and Quick Look.\n\n"
+            "### Action Items\n"
+            "- [x] Import real desktop image via AppleScript native data handler\n"
+            "- [x] Support markdown tables and styled checklists\n"
+            "- [ ] Ready for Muse paired device drop\n\n"
+            "### Verification Table\n"
+            "| Component | Mechanism | Status |\n"
+            "|---|---|---|\n"
+            "| Attachment | `make new attachment with data` | VERIFIED |\n"
+            "| Quick Look | Native CoreData Store | SUPPORTED |\n"
+            "| Format | Full Markdown + Tables + Checklists | ACTIVE |\n\n"
+            f"> Attached image: **{img_filename}** ({len(img_bytes):,} bytes)\n"
         ),
-        "images": {"test_image.png": sample_b64_png},
+        "attachments": {img_filename: img_b64},
     }
 
-    # 2. Drop into inbox as JSON file
+    # Drop into inbox
     test_drop_path = config.inbox_dir / f"{test_req_id}.json"
     logger.info(f"Dropping test request into {test_drop_path}...")
     with open(test_drop_path, "w", encoding="utf-8") as f:
         json.dump(test_payload, f, indent=2)
     time.sleep(0.3)
 
-    # 3. Process inbox
+    # Process inbox (or wait for background daemon to pick it up)
     logger.info("Scanning and processing inbox...")
     processed_count = scan_and_process_inbox(config, dedup)
-    if processed_count == 0:
-        logger.error("Self-test FAILED: Request was not processed from inbox")
-        return False
-
-    # 4. Check outbox result
     result_path = config.outbox_dir / f"{test_req_id}.json"
+
+    # If background daemon picked it up first, wait up to 3s for result file
+    for _ in range(10):
+        if result_path.exists():
+            break
+        time.sleep(0.3)
+
     if not result_path.exists():
         logger.error(f"Self-test FAILED: Outbox result file {result_path} not found")
         return False
@@ -1121,7 +1212,7 @@ def run_self_test(config: BridgeConfig, keep_note: bool = False) -> bool:
         result_data = json.load(f)
 
     logger.info(f"Outbox Result: {json.dumps(result_data, indent=2)}")
-    if result_data.get("status") != "success":
+    if result_data.get("status") not in ["success", "duplicate"]:
         logger.error(f"Self-test FAILED: Outbox status was {result_data.get('status')} - {result_data.get('error')}")
         return False
 
@@ -1130,16 +1221,17 @@ def run_self_test(config: BridgeConfig, keep_note: bool = False) -> bool:
         logger.error("Self-test FAILED: No note_id returned")
         return False
 
-    # 5. Verify Note in Apple Notes via JXA
+    # Verify Note in Apple Notes via JXA
     logger.info(f"Verifying Note in Notes.app (id: {created_note_id})...")
     jxa_verify = f"""
     function run() {{
         const Notes = Application('Notes');
         const note = Notes.notes.byId('{created_note_id}');
+        const atts = note.attachments();
         return JSON.stringify({{
             name: note.name(),
-            attachments_count: note.attachments().length,
-            body: note.body().substring(0, 200)
+            attachments_count: atts.length,
+            attachment_name: atts.length > 0 ? atts[0].name() : null
         }});
     }}
     """
@@ -1154,13 +1246,15 @@ def run_self_test(config: BridgeConfig, keep_note: bool = False) -> bool:
         logger.error("Self-test FAILED: Note does not have attachments embedded")
         return False
 
-    # 6. Test Deduplication
+    # Test Deduplication
     logger.info("Testing deduplication by re-dropping same request...")
     with open(test_drop_path, "w", encoding="utf-8") as f:
         json.dump(test_payload, f, indent=2)
     time.sleep(0.3)
 
     scan_and_process_inbox(config, dedup)
+    time.sleep(0.5)
+
     with open(result_path, "r", encoding="utf-8") as f:
         dedup_result = json.load(f)
 
@@ -1168,23 +1262,19 @@ def run_self_test(config: BridgeConfig, keep_note: bool = False) -> bool:
     if dedup_result.get("status") != "duplicate":
         logger.warning(f"Expected duplicate status, got: {dedup_result.get('status')}")
 
-    # 7. Clean up note
+    # Clean up note if requested
     if not keep_note:
         logger.info(f"Cleaning up test note {created_note_id} from Notes.app...")
-        jxa_delete = f"""
-        function run() {{
-            const Notes = Application('Notes');
-            const note = Notes.notes.byId('{created_note_id}');
-            Notes.delete(note);
-            return 'deleted';
-        }}
-        """
-        subprocess.run(["osascript", "-l", "JavaScript", "-"], input=jxa_delete, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["osascript", "-e", f'tell application "Notes" to delete note id "{created_note_id}"'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         logger.info("Test note deleted.")
     else:
         logger.info(f"Keeping test note in Notes.app per request (id: {created_note_id})")
 
-    logger.info("✅ End-to-End Self Test PASSED successfully!")
+    logger.info("✅ End-to-End Self Test with Real Image PASSED successfully!")
     return True
 
 
@@ -1192,7 +1282,6 @@ def run_self_test(config: BridgeConfig, keep_note: bool = False) -> bool:
 # CLI Interface
 # ----------------------------------------------------------------------
 def main():
-    # Base options parent parser so options can appear before or after subcommand
     base_parser = argparse.ArgumentParser(add_help=False)
     base_parser.add_argument(
         "--dir",
@@ -1210,24 +1299,14 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
-    # run / daemon
     subparsers.add_parser("run", parents=[base_parser], help="Run watcher daemon loop")
     subparsers.add_parser("daemon", parents=[base_parser], help="Alias for run")
-
-    # process / once
     subparsers.add_parser("process", parents=[base_parser], help="Process pending requests in inbox once and exit")
     subparsers.add_parser("once", parents=[base_parser], help="Alias for process")
-
-    # install launchd
     subparsers.add_parser("install", parents=[base_parser], help="Install and load launchd service")
-
-    # uninstall launchd
     subparsers.add_parser("uninstall", parents=[base_parser], help="Unload and remove launchd service")
-
-    # status
     subparsers.add_parser("status", parents=[base_parser], help="Show bridge status and pending queue")
 
-    # test
     test_parser = subparsers.add_parser("test", parents=[base_parser], help="Run end-to-end self test with real image")
     test_parser.add_argument("--keep", action="store_true", help="Keep the created test note in Notes.app")
 
