@@ -2,26 +2,26 @@
 
 # Rich Notes Bridge
 
-A local, file-based rich bridge for Apple Notes on macOS.
+**A companion bridge built for Muse** — it exists specifically to work around the limits of Muse's own built-in Apple Notes integration on macOS. Muse (and in principle any other external agent operating over a paired-device text channel) talks to this bridge through a local inbox/outbox folder pair instead of through its own Notes connector.
 
-Enables external agents (such as **Muse**) operating over paired-device text channels to create notes in Apple Notes with **true native attachments (images, PDFs, documents)**, rich formatting (tables, checklists, blockquotes, typography), target folder placement, and result reporting — and to **export the full body of an existing note** back out, for connectors whose own Notes read path truncates large notes.
+This local, file-based bridge lets Muse create notes in Apple Notes with **true native attachments (images, PDFs, documents)**, rich formatting (tables, checklists, blockquotes, typography), target folder placement, and result reporting — and to **export the full body of an existing note** back out, since Muse's own Notes connector caps a single read at 64 KiB and real notes routinely exceed that.
 
 ---
 
 ## Why This Exists
 
-External agents connected over paired channels often have text-only Apple Notes integrations. macOS Notes automation does not support binary image transfer over simple text AppleScript invocations, and WebKit URL loading inside Notes sandboxing fails on external `file://` URLs.
+Muse's own Apple Notes integration is text-only. macOS Notes automation does not support binary image transfer over simple text AppleScript invocations, and WebKit URL loading inside Notes sandboxing fails on external `file://` URLs — so Muse, talking to your Mac over its paired-device channel, has no native way to put a real image into a note.
 
 This bridge solves the limitation by using Apple Notes' native Cocoa scripting attachment handler:
-1. The external agent drops a manifest and base64-encoded image/document files into an inbox folder.
+1. Muse drops a manifest and base64-encoded image/document files into an inbox folder.
 2. A background watcher picks up the request and decodes attachments to temporary files in `/tmp`.
 3. The bridge invokes Apple Notes automation via AppleScript's native `make new attachment at theNote with data (POSIX file ...)` handler.
 4. Notes.app copies the files directly into its internal attachment store. The attachments render inline, support Quick Look, display high-resolution thumbnails, and sync across iCloud.
 5. Temporary scratch files in `/tmp` are immediately removed.
-6. A result receipt with the new note's CoreData ID is written back to the outbox for the external agent to read.
+6. A result receipt with the new note's CoreData ID is written back to the outbox for Muse to read.
 7. The request is moved to an archive directory to keep the inbox empty and clean.
 
-**Export (reading notes back out)** solves a related but different limitation: some external connectors cap a single note read at 64 KiB, and real notes routinely exceed that. An export request asks the bridge to read a note's full body via the same Notes automation access used for writing, and write it out as two plain files (full plaintext + full HTML) in the outbox — no 64 KiB cap, since the consumer reads the files directly via file transfer rather than through the connector's own truncating read path. Export is strictly read-only: it never creates, modifies, moves, or deletes the note it reads. See [`PROTOCOL.md`](PROTOCOL.md) for the full request/receipt schema.
+**Export (reading notes back out)** closes the read side of the same gap: an export request asks the bridge to read a note's full body via the same Notes automation access used for writing, and write it out as two plain files (full plaintext + full HTML) in the outbox — Muse then reads those via its own file transfer instead of through its truncating Notes connector. Export is strictly read-only: it never creates, modifies, moves, or deletes the note it reads. See [`PROTOCOL.md`](PROTOCOL.md) for the full request/receipt schema.
 
 **Design Constraints:**
 - **Stock macOS tools only**: Uses Python 3 standard library and system `osascript`. Zero third-party dependencies or pip packages.
@@ -37,7 +37,7 @@ By default, the bridge manages:
 
 ```
 ~/.rich-notes-bridge/
-├── inbox/     # External agent drops requests here
+├── inbox/     # Muse drops requests here
 ├── outbox/    # Bridge writes completion results here (receipts, and for
 │              # exports also <id>.body.txt / <id>.body.html)
 ├── archive/   # Processed requests are archived here
@@ -94,7 +94,7 @@ To process the inbox once and exit:
 
 ---
 
-## External Agent Protocol (Muse)
+## Muse Protocol
 
 For the complete specification, see [`PROTOCOL.md`](PROTOCOL.md).
 
