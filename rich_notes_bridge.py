@@ -4,7 +4,9 @@ Rich Notes Bridge for macOS Apple Notes
 ---------------------------------------
 Enables external agents (e.g. Muse) to create rich notes in Apple Notes
 with true native attachments (images, PDFs, documents), rich formatting
-(tables, checklists, code blocks, typography), and folder placement.
+(tables, checklists, code blocks, typography), and folder placement — and to
+export the full body of an existing note (plaintext + HTML) back out, for
+connectors whose own Notes read path truncates large notes.
 
 Stock macOS tools only (Python 3 standard library + native osascript AppleScript).
 Zero network, zero third-party dependencies, completely local and private.
@@ -395,6 +397,51 @@ class RichNoteRequest:
         return h.hexdigest()
 
 
+class ExportRequest:
+    """A read-only request to export an existing note's full body. Deliberately
+    does not share RichNoteRequest's shape (no folder/body/format/attachments
+    defaults make sense here) — export has its own request and receipt schema."""
+
+    def __init__(self, request_id: str, note_id: Optional[str], title: Optional[str], raw_source_path: Path):
+        self.request_id = request_id
+        self.note_id = note_id or None
+        self.title = title or None
+        self.raw_source_path = raw_source_path
+
+
+def _detect_op(item_path: Path, orig_name: str) -> str:
+    """Peeks at a single-JSON-file request's "op" field without fully parsing it
+    as a create request. Returns "create" (the default) for directories,
+    non-JSON files, missing/null "op", or any JSON that fails to parse — in
+    every one of those cases the existing create pipeline's own error handling
+    is what should run, unchanged, exactly as before this field existed."""
+    if item_path.is_dir():
+        return "create"
+    if Path(orig_name).suffix.lower() != ".json":
+        return "create"
+    try:
+        with open(item_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        return str(meta.get("op") or "create").lower()
+    except Exception:
+        return "create"
+
+
+def _parse_export_request(json_path: Path) -> ExportRequest:
+    with open(json_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    orig_name = json_path.name
+    if orig_name.endswith(".processing"):
+        orig_name = orig_name[:-len(".processing")]
+
+    req_id = meta.get("id") or Path(orig_name).stem
+    note_id = meta.get("note_id")
+    title = meta.get("title")
+
+    return ExportRequest(request_id=req_id, note_id=note_id, title=title, raw_source_path=json_path)
+
+
 def parse_request_from_path(item_path: Path) -> Optional[RichNoteRequest]:
     """
     Parses a request from:
@@ -710,6 +757,11 @@ def prepare_note_html_and_attachments(
 # ----------------------------------------------------------------------
 # Apple Notes Automation via AppleScript
 # ----------------------------------------------------------------------
+def _escape_applescript_string(s: str) -> str:
+    """Escapes a string for safe interpolation into a double-quoted AppleScript literal."""
+    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
 def execute_applescript_create_note(
     folder: str,
     title: str,
@@ -734,7 +786,7 @@ def execute_applescript_create_note(
     with open(body_file, "w", encoding="utf-8") as f:
         f.write(html_body)
 
-    safe_folder = (folder or "Notes").strip().replace("\\", "\\\\").replace('"', '\\"')
+    safe_folder = _escape_applescript_string((folder or "Notes").strip())
 
     script_lines = [
         'tell application "Notes"',
@@ -791,6 +843,336 @@ def execute_applescript_create_note(
 
 
 # ----------------------------------------------------------------------
+# Apple Notes Automation via AppleScript — Export (read-only)
+# ----------------------------------------------------------------------
+# Delimiter for AppleScript-side list joins (attachment names, candidate note IDs).
+# A control character virtually never present in a real filename or note title —
+# safer than comma/tab, which legitimately appear in both.
+_AS_LIST_SEP = "\x1f"
+
+
+def resolve_note_id_by_title(title: str) -> Dict[str, Any]:
+    """
+    Finds note(s) by exact title match. Returns one of:
+      {"status": "OK", "note_id": "..."}                       — exactly one match
+      {"status": "NOTFOUND"}                                    — zero matches
+      {"status": "MULTI", "candidates": ["id1", "id2", ...]}    — ambiguous
+      {"status": "ERROR", "error": "..."}                       — AppleScript failure
+
+    NOTE: Notes.app's `every note whose name is X` has been observed (verified
+    empirically against a real Notes.app, 2026-11-15) to enumerate each matching
+    note TWICE with byte-identical IDs — there is only one iCloud account on this
+    machine, so this is not a multi-account artifact, just a quirk of the flat
+    `notes` collection. Candidates are deduplicated by exact ID string before
+    deciding 0/1/multi, or every single-match title lookup would falsely report
+    "multiple notes found".
+    """
+    safe_title = _escape_applescript_string(title)
+    script = f'''
+    tell application "Notes"
+        try
+            set matchingNotes to every note whose name is "{safe_title}"
+        on error errMsg
+            return "ERROR" & tab & errMsg
+        end try
+        set idList to {{}}
+        repeat with aNote in matchingNotes
+            set thisId to (id of aNote)
+            if thisId is not in idList then
+                set end of idList to thisId
+            end if
+        end repeat
+        set n to count of idList
+        if n is 0 then
+            return "NOTFOUND"
+        else if n is 1 then
+            return "OK" & tab & (item 1 of idList)
+        else
+            set AppleScript's text item delimiters to "{_AS_LIST_SEP}"
+            set idJoined to idList as string
+            set AppleScript's text item delimiters to ""
+            return "MULTI" & tab & idJoined
+        end if
+    end tell
+    '''
+    res = subprocess.run(["osascript", "-"], input=script, capture_output=True, text=True)
+    if res.returncode != 0:
+        err = res.stderr.strip() or f"osascript failed with return code {res.returncode}"
+        return {"status": "ERROR", "error": err}
+
+    out = res.stdout.strip()
+    if not out:
+        return {"status": "ERROR", "error": "Notes.app automation returned empty response"}
+
+    parts = out.split("\t", 1)
+    status = parts[0]
+    if status == "OK":
+        return {"status": "OK", "note_id": parts[1] if len(parts) > 1 else ""}
+    if status == "NOTFOUND":
+        return {"status": "NOTFOUND"}
+    if status == "MULTI":
+        candidates = parts[1].split(_AS_LIST_SEP) if len(parts) > 1 else []
+        return {"status": "MULTI", "candidates": candidates}
+    if status == "ERROR":
+        return {"status": "ERROR", "error": parts[1] if len(parts) > 1 else "unknown error"}
+    return {"status": "ERROR", "error": f"Unrecognized automation response: {out!r}"}
+
+
+def execute_applescript_export_note(
+    note_id: str, plaintext_tmp_path: Path, html_tmp_path: Path
+) -> Dict[str, Any]:
+    """
+    Strictly read-only: looks up the note by its CoreData id and writes its full
+    plaintext and HTML body to the given temp file paths (written directly by
+    AppleScript via its own `write ... as «class utf8»`, so arbitrarily large
+    bodies never pass through the Python subprocess stdout pipe). Never
+    modifies, moves, or deletes the note. Returns metadata; raises RuntimeError
+    on any failure (missing note, locked/shared note, or a file-write error) —
+    the caller is expected to turn that into a clean error receipt.
+    """
+    safe_note_id = _escape_applescript_string(note_id)
+    safe_plaintext_path = _escape_applescript_string(str(plaintext_tmp_path.resolve()))
+    safe_html_path = _escape_applescript_string(str(html_tmp_path.resolve()))
+
+    script = f'''
+    tell application "Notes"
+        try
+            set theNote to note id "{safe_note_id}"
+        on error errMsg
+            return "ERROR" & tab & "note not found: " & errMsg
+        end try
+
+        set noteTitle to "Untitled Note"
+        try
+            set noteTitle to name of theNote
+        end try
+
+        set folderName to ""
+        try
+            set theContainer to container of theNote
+            set folderName to name of theContainer
+        end try
+
+        set attNames to {{}}
+        try
+            set attNames to name of every attachment of theNote
+        end try
+
+        set plaintextOk to 1
+        set thePlaintext to ""
+        try
+            set thePlaintext to plaintext of theNote
+        on error
+            set plaintextOk to 0
+        end try
+
+        set htmlOk to 1
+        set theHtml to ""
+        try
+            set theHtml to body of theNote
+        on error
+            set htmlOk to 0
+        end try
+
+        try
+            set fRef to open for access (POSIX file "{safe_plaintext_path}") with write permission
+            set eof fRef to 0
+            write thePlaintext to fRef as «class utf8»
+            close access fRef
+        on error errMsg2
+            try
+                close access (POSIX file "{safe_plaintext_path}")
+            end try
+            return "ERROR" & tab & "failed writing plaintext output: " & errMsg2
+        end try
+
+        try
+            set fRef2 to open for access (POSIX file "{safe_html_path}") with write permission
+            set eof fRef2 to 0
+            write theHtml to fRef2 as «class utf8»
+            close access fRef2
+        on error errMsg3
+            try
+                close access (POSIX file "{safe_html_path}")
+            end try
+            return "ERROR" & tab & "failed writing html output: " & errMsg3
+        end try
+
+        set AppleScript's text item delimiters to "{_AS_LIST_SEP}"
+        set attJoined to attNames as string
+        set AppleScript's text item delimiters to ""
+
+        return "OK" & tab & noteTitle & tab & folderName & tab & attJoined & tab & (plaintextOk as string) & tab & (htmlOk as string)
+    end tell
+    '''
+    res = subprocess.run(["osascript", "-"], input=script, capture_output=True, text=True)
+
+    if res.returncode != 0:
+        error_msg = res.stderr.strip() or f"AppleScript failed with return code {res.returncode}"
+        raise RuntimeError(f"Notes.app export automation error: {error_msg}")
+
+    output_str = res.stdout.strip()
+    if not output_str:
+        raise RuntimeError("Notes.app export automation returned empty response")
+
+    parts = output_str.split("\t")
+    if parts[0] == "ERROR":
+        raise RuntimeError(parts[1] if len(parts) > 1 else "Unknown Notes.app export error")
+    if parts[0] != "OK" or len(parts) < 6:
+        raise RuntimeError(f"Unrecognized export automation response: {output_str!r}")
+
+    title, folder_name, att_joined, plaintext_ok, html_ok = parts[1], parts[2], parts[3], parts[4], parts[5]
+    attachment_names = [a for a in att_joined.split(_AS_LIST_SEP) if a] if att_joined else []
+
+    if plaintext_ok != "1":
+        logger.warning(f"Note {note_id}: plaintext property unavailable, .body.txt will be empty")
+    if html_ok != "1":
+        logger.warning(f"Note {note_id}: body (HTML) property unavailable, .body.html will be empty")
+
+    return {
+        "title": title,
+        "folder": folder_name,
+        "attachments": attachment_names,
+    }
+
+
+# ----------------------------------------------------------------------
+# Request Processing Pipeline — Export (read-only, no dedup)
+# ----------------------------------------------------------------------
+def process_export_request(item_path: Path, config: BridgeConfig) -> Dict[str, Any]:
+    """
+    Processes a single "op": "export" request. Fully separate from the create
+    pipeline: never touches DedupManager (an export always re-reads fresh —
+    the note may have been edited since a prior export of the same id), never
+    writes to Notes.app, and cannot trigger any of the create-path's side
+    effects. Any failure (missing note, ambiguous title, locked/shared note,
+    bad request) becomes a clean "status": "error" receipt — this function is
+    never allowed to raise, crash the caller, or hang the watcher loop.
+    """
+    orig_name = item_path.name
+    if orig_name.endswith(".processing"):
+        orig_name = orig_name[:-len(".processing")]
+    req_id = Path(orig_name).stem
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    req: Optional[ExportRequest] = None
+
+    def _error(message: str, candidates: Optional[List[str]] = None) -> Dict[str, Any]:
+        logger.error(f"Export request {req_id} failed: {message}")
+        result = {
+            "id": req_id,
+            "status": "error",
+            "op": "export",
+            "note_id": req.note_id if req else None,
+            "title": req.title if req else None,
+            "folder": None,
+            "attachments_count": 0,
+            "attachments": [],
+            "body_chars": None,
+            "body_bytes": None,
+            "body_sha256": None,
+            "body_file": None,
+            "html_file": None,
+            "processed_at": now_iso,
+            "error": message,
+        }
+        if candidates is not None:
+            result["candidates"] = candidates
+        _write_result(config, req_id, result)
+        _archive_request(item_path, config.archive_dir / "failed", req_id)
+        return result
+
+    try:
+        req = _parse_export_request(item_path)
+        req_id = req.request_id
+    except Exception as e:
+        logger.error(f"Error parsing export request {item_path.name}: {e}", exc_info=True)
+        return _error(f"Failed to parse export request: {e}")
+
+    note_id = req.note_id
+    if not note_id:
+        if not req.title:
+            return _error("Export request has neither note_id nor title — cannot identify the note")
+        logger.info(f"Export {req_id}: resolving note by title '{req.title}'...")
+        lookup = resolve_note_id_by_title(req.title)
+        if lookup["status"] == "NOTFOUND":
+            return _error(f"No note found with title {req.title!r}")
+        if lookup["status"] == "MULTI":
+            candidates = lookup.get("candidates", [])
+            return _error(
+                f"{len(candidates)} notes match title {req.title!r} — provide note_id to disambiguate, never guessing",
+                candidates=candidates,
+            )
+        if lookup["status"] == "ERROR":
+            return _error(f"Title lookup failed: {lookup.get('error', 'unknown error')}")
+        note_id = lookup["note_id"]
+
+    config.outbox_dir.mkdir(parents=True, exist_ok=True)
+    body_filename = f"{req_id}.body.txt"
+    html_filename = f"{req_id}.body.html"
+    plaintext_tmp = config.outbox_dir / f"{body_filename}.tmp"
+    html_tmp = config.outbox_dir / f"{html_filename}.tmp"
+    plaintext_final = config.outbox_dir / body_filename
+    html_final = config.outbox_dir / html_filename
+
+    try:
+        logger.info(f"Export {req_id}: reading note {note_id} (read-only)...")
+        meta = execute_applescript_export_note(note_id, plaintext_tmp, html_tmp)
+    except Exception as e:
+        logger.error(f"Export {req_id} automation error for note {note_id}: {e}")
+        for p in (plaintext_tmp, html_tmp):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+        return _error(str(e))
+
+    try:
+        body_bytes_data = plaintext_tmp.read_bytes()
+        body_chars = len(body_bytes_data.decode("utf-8"))
+        body_bytes = len(body_bytes_data)
+        body_sha256 = hashlib.sha256(body_bytes_data).hexdigest()
+
+        os.replace(plaintext_tmp, plaintext_final)
+        os.replace(html_tmp, html_final)
+    except Exception as e:
+        logger.error(f"Export {req_id}: failed finalizing output files: {e}", exc_info=True)
+        for p in (plaintext_tmp, html_tmp):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+        return _error(f"Failed writing export outputs: {e}")
+
+    logger.info(
+        f"Export {req_id}: wrote {body_filename} ({body_chars:,} chars, {body_bytes:,} bytes) "
+        f"and {html_filename} for note '{meta['title']}'"
+    )
+
+    result = {
+        "id": req_id,
+        "status": "success",
+        "op": "export",
+        "note_id": note_id,
+        "title": meta["title"],
+        "folder": meta["folder"],
+        "attachments_count": len(meta["attachments"]),
+        "attachments": meta["attachments"],
+        "body_chars": body_chars,
+        "body_bytes": body_bytes,
+        "body_sha256": body_sha256,
+        "body_file": body_filename,
+        "html_file": html_filename,
+        "processed_at": now_iso,
+        "error": None,
+    }
+    _write_result(config, req_id, result)
+    _archive_request(item_path, config.archive_dir, req_id)
+    return result
+
+
+# ----------------------------------------------------------------------
 # Request Processing Pipeline
 # ----------------------------------------------------------------------
 def process_request(item_path: Path, config: BridgeConfig, dedup: DedupManager) -> Dict[str, Any]:
@@ -802,6 +1184,26 @@ def process_request(item_path: Path, config: BridgeConfig, dedup: DedupManager) 
         orig_name = orig_name[:-len(".processing")]
     req_id = Path(orig_name).stem
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    op = _detect_op(item_path, orig_name)
+    if op == "export":
+        return process_export_request(item_path, config)
+    if op != "create":
+        logger.error(f"Request {req_id} has unrecognized op {op!r} — refusing to guess, erroring cleanly")
+        error_result = {
+            "id": req_id,
+            "status": "error",
+            "note_id": None,
+            "title": "Unknown",
+            "folder": "Notes",
+            "attachments_count": 0,
+            "attachments": [],
+            "processed_at": now_iso,
+            "error": f"Unrecognized op {op!r} (expected \"create\" or \"export\")",
+        }
+        _write_result(config, req_id, error_result)
+        _archive_request(item_path, config.archive_dir / "failed", req_id)
+        return error_result
 
     try:
         req = parse_request_from_path(item_path)
@@ -1274,17 +1676,281 @@ def run_self_test(config: BridgeConfig, keep_note: bool = False) -> bool:
 
 
 # ----------------------------------------------------------------------
+# Export Self Test Utility
+# ----------------------------------------------------------------------
+def _get_plaintext_directly_for_test(note_id: str) -> str:
+    """
+    Independent oracle for the export self-test: reads a note's plaintext via a
+    minimal standalone AppleScript call captured over stdout — deliberately NOT
+    using execute_applescript_export_note (which writes via a file instead), so
+    the self-test's expectation isn't computed with the same code path it is
+    verifying. A real export bug in the file-writing code would still be caught
+    by comparing against this independently-derived value.
+    """
+    safe_note_id = _escape_applescript_string(note_id)
+    script = f'tell application "Notes" to plaintext of note id "{safe_note_id}"'
+    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"Oracle plaintext read failed: {res.stderr.strip()}")
+    # osascript appends a trailing newline to -e output; strip exactly that one,
+    # not arbitrary trailing whitespace the note's own content might end with.
+    out = res.stdout
+    if out.endswith("\n"):
+        out = out[:-1]
+    return out
+
+
+def _build_large_plain_text_body(target_chars: int = 125_000) -> str:
+    """
+    Builds a plain-text body with NO markdown-special characters (#, *, -, |, >,
+    backtick) so it survives create's markdown_to_html -> Notes.app render ->
+    plaintext round trip without any syntax being stripped or reinterpreted —
+    each line becomes exactly one <div> and should come back as exactly one
+    plaintext line. Varied sentence content (not one repeated line) so a
+    truncation bug can't hide behind a sea of identical characters.
+    """
+    sentences = [
+        "The quick brown fox jumps over the lazy dog near the old stone bridge.",
+        "Paste bin contents often exceed what a chat connector can read in one call.",
+        "Apple Notes stores note bodies as rendered HTML inside a CoreData store.",
+        "This line intentionally avoids markdown syntax so the round trip stays clean.",
+        "Every paragraph here is distinct text, not a repeated filler character.",
+        "The bridge communicates over a local inbox and outbox folder pair only.",
+        "Export requests are strictly read only and never modify the source note.",
+        "Large bodies are written directly to file from within the AppleScript itself.",
+    ]
+    lines = []
+    total = 0
+    i = 0
+    while total < target_chars:
+        line = f"{sentences[i % len(sentences)]} (line {i})"
+        lines.append(line)
+        total += len(line) + 1
+        i += 1
+    return "\n".join(lines)
+
+
+def run_export_self_test(config: BridgeConfig, keep_note: bool = False) -> bool:
+    """
+    End-to-end self test for the export operation:
+    1. Creates a note with a body over 100 KB via the normal create path.
+    2. Independently reads the note's real plaintext (oracle, see
+       _get_plaintext_directly_for_test) and computes its expected char count
+       and SHA-256 BEFORE exporting anything.
+    3. Exports the note via the bridge and asserts the exported .body.txt
+       file's char count and SHA-256 match the independently-computed oracle
+       values exactly, and that .body.html was written and is non-empty.
+    4. Re-drops the SAME export request id and asserts it succeeds again with
+       fresh output (not blocked by the create-dedup mechanism).
+    5. Exercises title-based lookup: a unique title resolves and exports; a
+       title shared by two notes errors out and lists both candidate IDs
+       rather than guessing.
+    6. Exercises error handling: a well-formed but nonexistent note_id
+       produces a clean "status": "error" receipt, not a crash.
+    """
+    logger.info("Starting Export Self Test (>100KB round trip, re-export, title lookup, error handling)...")
+    config.ensure_directories()
+    dedup = DedupManager(config.dedup_file)
+
+    created_note_ids: List[str] = []
+
+    def _cleanup():
+        if keep_note:
+            logger.info(f"Keeping {len(created_note_ids)} export-test note(s) in Notes.app per request")
+            return
+        for nid in created_note_ids:
+            subprocess.run(
+                ["osascript", "-e", f'tell application "Notes" to delete note id "{nid}"'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        logger.info(f"Cleaned up {len(created_note_ids)} export-test note(s)")
+
+    try:
+        # --- 1. Create the >100KB source note ---
+        large_body = _build_large_plain_text_body()
+        logger.info(f"Built test body: {len(large_body):,} chars")
+        if len(large_body) < 100_000:
+            logger.error(f"Export self-test body generator produced only {len(large_body)} chars — test is invalid")
+            return False
+
+        create_req_id = f"export-test-create-{int(time.time())}"
+        create_title = f"Export Bridge Large Note Test ({create_req_id})"
+        create_payload = {"id": create_req_id, "title": create_title, "folder": "Notes", "format": "markdown", "body": large_body}
+        (config.inbox_dir / f"{create_req_id}.json").write_text(json.dumps(create_payload), encoding="utf-8")
+        time.sleep(0.3)
+        scan_and_process_inbox(config, dedup)
+
+        create_result_path = config.outbox_dir / f"{create_req_id}.json"
+        for _ in range(10):
+            if create_result_path.exists():
+                break
+            time.sleep(0.3)
+        if not create_result_path.exists():
+            logger.error("Export self-test FAILED: create step produced no outbox receipt")
+            return False
+        create_result = json.loads(create_result_path.read_text(encoding="utf-8"))
+        if create_result.get("status") != "success" or not create_result.get("note_id"):
+            logger.error(f"Export self-test FAILED: create step did not succeed: {create_result}")
+            return False
+        note_id = create_result["note_id"]
+        created_note_ids.append(note_id)
+        logger.info(f"Created large test note: {note_id}")
+
+        # --- 2. Independent oracle, computed BEFORE the export code runs ---
+        oracle_plaintext = _get_plaintext_directly_for_test(note_id)
+        oracle_chars = len(oracle_plaintext)
+        oracle_sha256 = hashlib.sha256(oracle_plaintext.encode("utf-8")).hexdigest()
+        logger.info(f"Oracle plaintext: {oracle_chars:,} chars, sha256={oracle_sha256[:12]}...")
+
+        # --- 3. Export via the bridge and verify against the oracle ---
+        export_req_id = f"export-test-{int(time.time())}"
+        export_payload = {"id": export_req_id, "op": "export", "note_id": note_id, "title": None}
+        (config.inbox_dir / f"{export_req_id}.json").write_text(json.dumps(export_payload), encoding="utf-8")
+        time.sleep(0.3)
+        scan_and_process_inbox(config, dedup)
+
+        export_result_path = config.outbox_dir / f"{export_req_id}.json"
+        for _ in range(10):
+            if export_result_path.exists():
+                break
+            time.sleep(0.3)
+        if not export_result_path.exists():
+            logger.error("Export self-test FAILED: export step produced no outbox receipt")
+            return False
+        export_result = json.loads(export_result_path.read_text(encoding="utf-8"))
+        logger.info(f"Export receipt: {json.dumps(export_result, indent=2)}")
+        if export_result.get("status") != "success":
+            logger.error(f"Export self-test FAILED: export status was {export_result.get('status')}: {export_result.get('error')}")
+            return False
+        if export_result.get("body_chars") != oracle_chars:
+            logger.error(f"Export self-test FAILED: body_chars {export_result.get('body_chars')} != oracle {oracle_chars}")
+            return False
+        if export_result.get("body_sha256") != oracle_sha256:
+            logger.error(f"Export self-test FAILED: body_sha256 mismatch vs oracle")
+            return False
+
+        body_file = config.outbox_dir / export_result["body_file"]
+        html_file = config.outbox_dir / export_result["html_file"]
+        if not body_file.exists() or not html_file.exists():
+            logger.error("Export self-test FAILED: .body.txt / .body.html not found in outbox")
+            return False
+        on_disk_bytes = body_file.read_bytes()
+        on_disk_sha256 = hashlib.sha256(on_disk_bytes).hexdigest()
+        if on_disk_sha256 != oracle_sha256:
+            logger.error("Export self-test FAILED: on-disk .body.txt sha256 doesn't match the oracle")
+            return False
+        if html_file.stat().st_size == 0:
+            logger.error("Export self-test FAILED: .body.html is empty")
+            return False
+        logger.info("Export round-trip verified: char count and SHA-256 match the independent oracle exactly.")
+
+        # --- 4. Re-export the same id: must succeed fresh, not be dedup-blocked ---
+        time.sleep(0.3)
+        (config.inbox_dir / f"{export_req_id}.json").write_text(json.dumps(export_payload), encoding="utf-8")
+        time.sleep(0.3)
+        scan_and_process_inbox(config, dedup)
+        time.sleep(0.3)
+        reexport_result = json.loads(export_result_path.read_text(encoding="utf-8"))
+        if reexport_result.get("status") != "success":
+            logger.error(f"Export self-test FAILED: re-export status was {reexport_result.get('status')}, expected fresh success (not dedup-blocked)")
+            return False
+        logger.info("Re-export verified: not blocked by create-dedup, produced fresh success.")
+
+        # --- 5a. Title-based lookup: unique title resolves ---
+        title_req_id = f"export-test-title-{int(time.time())}"
+        title_payload = {"id": title_req_id, "op": "export", "note_id": None, "title": create_title}
+        (config.inbox_dir / f"{title_req_id}.json").write_text(json.dumps(title_payload), encoding="utf-8")
+        time.sleep(0.3)
+        scan_and_process_inbox(config, dedup)
+        title_result_path = config.outbox_dir / f"{title_req_id}.json"
+        for _ in range(10):
+            if title_result_path.exists():
+                break
+            time.sleep(0.3)
+        title_result = json.loads(title_result_path.read_text(encoding="utf-8")) if title_result_path.exists() else {}
+        if title_result.get("status") != "success" or title_result.get("note_id") != note_id:
+            logger.error(f"Export self-test FAILED: title-based lookup did not resolve to the right note: {title_result}")
+            return False
+        logger.info("Title-based lookup (unique match) verified.")
+
+        # --- 5b. Title-based lookup: duplicate title errors with candidates listed ---
+        dup_title = f"Export Bridge Dup Title Test {int(time.time())}"
+        dup_payload_a = {"id": f"{title_req_id}-dup-a", "title": dup_title, "folder": "Notes", "format": "markdown", "body": "First duplicate."}
+        dup_payload_b = {"id": f"{title_req_id}-dup-b", "title": dup_title, "folder": "Notes", "format": "markdown", "body": "Second duplicate."}
+        for p in (dup_payload_a, dup_payload_b):
+            (config.inbox_dir / f"{p['id']}.json").write_text(json.dumps(p), encoding="utf-8")
+        time.sleep(0.3)
+        scan_and_process_inbox(config, dedup)
+        for p in (dup_payload_a, dup_payload_b):
+            res_path = config.outbox_dir / f"{p['id']}.json"
+            if res_path.exists():
+                r = json.loads(res_path.read_text(encoding="utf-8"))
+                if r.get("status") == "success" and r.get("note_id"):
+                    created_note_ids.append(r["note_id"])
+
+        dup_export_req_id = f"export-test-dup-{int(time.time())}"
+        dup_export_payload = {"id": dup_export_req_id, "op": "export", "note_id": None, "title": dup_title}
+        (config.inbox_dir / f"{dup_export_req_id}.json").write_text(json.dumps(dup_export_payload), encoding="utf-8")
+        time.sleep(0.3)
+        scan_and_process_inbox(config, dedup)
+        dup_result_path = config.outbox_dir / f"{dup_export_req_id}.json"
+        for _ in range(10):
+            if dup_result_path.exists():
+                break
+            time.sleep(0.3)
+        dup_result = json.loads(dup_result_path.read_text(encoding="utf-8")) if dup_result_path.exists() else {}
+        if dup_result.get("status") != "error" or len(dup_result.get("candidates", [])) != 2:
+            logger.error(f"Export self-test FAILED: ambiguous-title export should error with 2 candidates, got: {dup_result}")
+            return False
+        logger.info("Title-based lookup (ambiguous match) verified: errored cleanly, listed both candidates.")
+
+        # --- 6. Bogus note_id: clean error, no crash ---
+        bogus_req_id = f"export-test-bogus-{int(time.time())}"
+        bogus_payload = {"id": bogus_req_id, "op": "export", "note_id": "x-coredata://00000000-0000-0000-0000-000000000000/ICNote/p999999999", "title": None}
+        (config.inbox_dir / f"{bogus_req_id}.json").write_text(json.dumps(bogus_payload), encoding="utf-8")
+        time.sleep(0.3)
+        processed = scan_and_process_inbox(config, dedup)  # must not raise
+        bogus_result_path = config.outbox_dir / f"{bogus_req_id}.json"
+        for _ in range(10):
+            if bogus_result_path.exists():
+                break
+            time.sleep(0.3)
+        bogus_result = json.loads(bogus_result_path.read_text(encoding="utf-8")) if bogus_result_path.exists() else {}
+        if bogus_result.get("status") != "error" or not bogus_result.get("error"):
+            logger.error(f"Export self-test FAILED: bogus note_id should produce a clean error receipt, got: {bogus_result}")
+            return False
+        logger.info("Bogus note_id handling verified: clean error receipt, watcher stayed alive.")
+
+        logger.info("✅ Export Self Test PASSED successfully!")
+        return True
+
+    finally:
+        _cleanup()
+
+
+# ----------------------------------------------------------------------
 # CLI Interface
 # ----------------------------------------------------------------------
 def main():
+    # NOTE on default=argparse.SUPPRESS below: --dir/-v are registered via `parents=`
+    # on BOTH the top-level parser AND every subparser, so a concrete default on either
+    # copy wins depending on argparse's internal re-application of subparser defaults —
+    # in practice this silently discarded "--dir X test" (flag BEFORE the subcommand,
+    # the only form this script's own launchd plist ever generates; see
+    # generate_launchd_plist) and silently fell back to DEFAULT_BASE_DIR. SUPPRESS means
+    # an unset flag leaves the attribute off the namespace entirely instead of
+    # re-asserting a default, so whichever parser actually saw the flag is the one that
+    # wins; the real default is applied via getattr() below instead of default=.
+    # Verified empirically (2026-11-15) that this is the only combination where
+    # "--dir X test", "test --dir X", and "test" (no flag) all resolve correctly.
     base_parser = argparse.ArgumentParser(add_help=False)
     base_parser.add_argument(
         "--dir",
         type=Path,
-        default=DEFAULT_BASE_DIR,
+        default=argparse.SUPPRESS,
         help=f"Base directory for inbox/outbox/archive (default: {DEFAULT_BASE_DIR})",
     )
-    base_parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging")
+    base_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose debug logging")
 
     parser = argparse.ArgumentParser(
         description="Rich Notes Bridge for macOS Apple Notes",
@@ -1302,12 +1968,12 @@ def main():
     subparsers.add_parser("uninstall", parents=[base_parser], help="Unload and remove launchd service")
     subparsers.add_parser("status", parents=[base_parser], help="Show bridge status and pending queue")
 
-    test_parser = subparsers.add_parser("test", parents=[base_parser], help="Run end-to-end self test with real image")
+    test_parser = subparsers.add_parser("test", parents=[base_parser], help="Run end-to-end self tests (image attachment + export round trip)")
     test_parser.add_argument("--keep", action="store_true", help="Keep the created test note in Notes.app")
 
     args = parser.parse_args()
-    config = BridgeConfig(args.dir)
-    setup_logging(config, args.verbose)
+    config = BridgeConfig(getattr(args, "dir", DEFAULT_BASE_DIR))
+    setup_logging(config, getattr(args, "verbose", False))
 
     script_path = Path(__file__).resolve()
 
@@ -1324,8 +1990,16 @@ def main():
     elif args.command == "status":
         check_status(config)
     elif args.command == "test":
-        success = run_self_test(config, keep_note=args.keep)
-        sys.exit(0 if success else 1)
+        image_test_passed = run_self_test(config, keep_note=args.keep)
+        export_test_passed = run_export_self_test(config, keep_note=args.keep)
+        if image_test_passed and export_test_passed:
+            logger.info("✅ ALL self tests passed (image attachment test + export round-trip test).")
+        else:
+            logger.error(
+                f"Self test suite FAILED — image test: {'PASS' if image_test_passed else 'FAIL'}, "
+                f"export test: {'PASS' if export_test_passed else 'FAIL'}"
+            )
+        sys.exit(0 if (image_test_passed and export_test_passed) else 1)
     else:
         parser.print_help()
 

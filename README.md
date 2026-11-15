@@ -4,7 +4,7 @@
 
 A local, file-based rich bridge for Apple Notes on macOS.
 
-Enables external agents (such as **Muse**) operating over paired-device text channels to create notes in Apple Notes with **true native attachments (images, PDFs, documents)**, rich formatting (tables, checklists, blockquotes, typography), target folder placement, and result reporting.
+Enables external agents (such as **Muse**) operating over paired-device text channels to create notes in Apple Notes with **true native attachments (images, PDFs, documents)**, rich formatting (tables, checklists, blockquotes, typography), target folder placement, and result reporting — and to **export the full body of an existing note** back out, for connectors whose own Notes read path truncates large notes.
 
 ---
 
@@ -21,6 +21,8 @@ This bridge solves the limitation by using Apple Notes' native Cocoa scripting a
 6. A result receipt with the new note's CoreData ID is written back to the outbox for the external agent to read.
 7. The request is moved to an archive directory to keep the inbox empty and clean.
 
+**Export (reading notes back out)** solves a related but different limitation: some external connectors cap a single note read at 64 KiB, and real notes routinely exceed that. An export request asks the bridge to read a note's full body via the same Notes automation access used for writing, and write it out as two plain files (full plaintext + full HTML) in the outbox — no 64 KiB cap, since the consumer reads the files directly via file transfer rather than through the connector's own truncating read path. Export is strictly read-only: it never creates, modifies, moves, or deletes the note it reads. See [`PROTOCOL.md`](PROTOCOL.md) for the full request/receipt schema.
+
 **Design Constraints:**
 - **Stock macOS tools only**: Uses Python 3 standard library and system `osascript`. Zero third-party dependencies or pip packages.
 - **Zero network / completely local**: No servers, no network ports, nothing exposed.
@@ -36,9 +38,11 @@ By default, the bridge manages:
 ```
 ~/.rich-notes-bridge/
 ├── inbox/     # External agent drops requests here
-├── outbox/    # Bridge writes completion results here
+├── outbox/    # Bridge writes completion results here (receipts, and for
+│              # exports also <id>.body.txt / <id>.body.html)
 ├── archive/   # Processed requests are archived here
-├── state/     # Persistent deduplication tracking (dedup.json)
+├── state/     # Persistent deduplication tracking (dedup.json) — create only,
+│              # export requests never touch this
 └── logs/      # Service logs (launchd.log, bridge.log)
 ```
 
@@ -49,7 +53,7 @@ By default, the bridge manages:
 ## Quick Start & Installation
 
 ### 1. Run Self-Test
-Verify that your Mac's Notes automation is ready and create an end-to-end test note with a real image and rich formatting:
+Verify that your Mac's Notes automation is ready. Runs two independent end-to-end tests: creating a note with a real image and rich formatting, and exporting an existing note's full body (including a >100 KB note, verified byte-for-byte against an independently-read oracle):
 
 ```bash
 ./rich_notes_bridge.py test
@@ -140,6 +144,21 @@ The bridge writes `~/.rich-notes-bridge/outbox/<request_id>.json`:
 
 If the same request is dropped again, the bridge responds with `"status": "duplicate"` and returns the existing `note_id` without creating duplicates in Notes.app.
 
+### Exporting an Existing Note
+
+Write `~/.rich-notes-bridge/inbox/<request_id>.json` with `"op": "export"` instead of dropping a create payload:
+
+```json
+{
+  "id": "export-pastebin-20261115",
+  "op": "export",
+  "note_id": "x-coredata://XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX/ICNote/p4304",
+  "title": null
+}
+```
+
+The bridge writes the note's full plaintext and HTML to `outbox/<id>.body.txt` and `outbox/<id>.body.html` (no size cap — read them via file transfer, not the connector's own Notes read path), plus a `outbox/<id>.json` receipt. If `note_id` is `null`, the note is looked up by exact `title` instead — zero matches or more than one match both error out rather than guessing (an ambiguous match lists every candidate note ID in the receipt's `candidates` field). **Export is strictly read-only** (never creates, modifies, or deletes a note) and is **never blocked by the create-dedup mechanism** — re-dropping the same export `id` always re-reads the note fresh, since it may have been edited since the last export. Full schema and error cases: [`PROTOCOL.md`](PROTOCOL.md).
+
 ---
 
 ## CLI Reference
@@ -153,8 +172,10 @@ commands:
   install            Install and load the launchd background agent
   uninstall          Unload and remove the launchd background agent
   status             Show bridge status, queue counts, and launchd health
-  test               Run end-to-end self test with an actual image
+  test               Run end-to-end self tests (image attachment + export round trip)
 ```
+
+`--dir`/`-v` work in any position (`rich_notes_bridge.py --dir <path> test` or `rich_notes_bridge.py test --dir <path>` both honor the override).
 
 ---
 
@@ -164,3 +185,4 @@ commands:
 - **Stock Tools Only**: Python standard library + macOS `osascript`.
 - **Restricted Permissions**: Default directory permissions created with `0700`.
 - **Atomic File Operations**: Uses rename-locking to prevent partial reads or concurrency races.
+- **Export is read-only**: An export request can only read a note's existing body — the code path that handles it has no ability to create, edit, move, or delete anything in Notes.app.
