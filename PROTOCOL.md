@@ -129,7 +129,7 @@ Once processed, the bridge immediately writes an execution receipt to:
 {
   "id": "meeting-20261103",
   "status": "success",
-  "note_id": "x-coredata://DD081B86-368A-4CBC-A6F5-CD822A89C8EE/ICNote/p9450",
+  "note_id": "x-coredata://XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX/ICNote/p9450",
   "title": "Architecture Review & Sketches",
   "folder": "Notes",
   "attachments_count": 1,
@@ -147,7 +147,7 @@ If the same request ID or identical content is received again:
 {
   "id": "meeting-20261103",
   "status": "duplicate",
-  "note_id": "x-coredata://DD081B86-368A-4CBC-A6F5-CD822A89C8EE/ICNote/p9450",
+  "note_id": "x-coredata://XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX/ICNote/p9450",
   "title": "Architecture Review & Sketches",
   "folder": "Notes",
   "attachments_count": 1,

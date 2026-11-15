@@ -1,4 +1,6 @@
-# muse-apple-notes-rich-bridge
+![Rich Notes Bridge — let any external agent write real Apple Notes with native attachments](assets/banner.png)
+
+# Rich Notes Bridge
 
 A local, file-based rich bridge for Apple Notes on macOS.
 
@@ -124,7 +126,7 @@ The bridge writes `~/.rich-notes-bridge/outbox/<request_id>.json`:
 {
   "id": "req-20261103-01",
   "status": "success",
-  "note_id": "x-coredata://DD081B86-368A-4CBC-A6F5-CD822A89C8EE/ICNote/p9450",
+  "note_id": "x-coredata://XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX/ICNote/p9450",
   "title": "System Architecture & Sketches",
   "folder": "Notes",
   "attachments_count": 1,

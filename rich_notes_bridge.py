@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Default Paths
 DEFAULT_BASE_DIR = Path(os.environ.get("RICH_NOTES_BRIDGE_DIR", os.path.expanduser("~/.rich-notes-bridge")))
-LAUNCH_AGENT_LABEL = "com.conner.rich-notes-bridge"
+LAUNCH_AGENT_LABEL = "com.rich-notes-bridge.agent"
 LAUNCH_AGENT_PATH = Path(os.path.expanduser(f"~/Library/LaunchAgents/{LAUNCH_AGENT_LABEL}.plist"))
 
 logger = logging.getLogger("rich_notes_bridge")
@@ -1108,11 +1108,6 @@ def check_status(config: BridgeConfig):
 # ----------------------------------------------------------------------
 def get_or_create_real_test_image() -> Tuple[str, bytes]:
     """Finds a real photographic image from desktop or resamples wallpaper."""
-    desktop_adorno = Path(os.path.expanduser("~/Desktop/adorno-table-frame.jpg"))
-    if desktop_adorno.exists():
-        with open(desktop_adorno, "rb") as f:
-            return "adorno-table-frame.jpg", f.read()
-
     desktop_dir = Path(os.path.expanduser("~/Desktop"))
     for ext in ["*.jpg", "*.jpeg", "*.png", "*.webp"]:
         candidates = list(desktop_dir.glob(ext))
