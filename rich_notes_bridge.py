@@ -1401,19 +1401,56 @@ def scan_and_process_inbox(config: BridgeConfig, dedup: DedupManager) -> int:
 
 
 def run_daemon_loop(config: BridgeConfig, poll_interval: float = 1.0):
-    """Main watcher loop."""
+    """
+    Main watcher loop.
+
+    Self-healing staleness check: a long-running interpreted process keeps
+    running whatever code was on disk at the moment IT started, forever —
+    editing the script on disk has no effect on an already-running watcher
+    until that process restarts. This silently produced stale behavior in
+    production (2026-11-15: an edited-in export feature, dropped against an
+    already-running watcher, got handled as a plain create because the
+    resident process had no way to know the file underneath it had changed).
+    To make that failure mode impossible going forward, the loop records its
+    own start-of-script mtime once, and re-checks it every poll cycle; if the
+    file has been edited since, it logs why and exits cleanly. Under launchd
+    with KeepAlive=true (this script's own install_launchd), that exit is an
+    automatic, near-instant restart onto the fresh code — no manual
+    `launchctl kickstart` ever required again. Running in the foreground
+    (`run`, no launchd) exits too, with a clear message instead of silently
+    continuing on stale code; there's no KeepAlive to restart it there, so a
+    human needs to re-launch it, but at least it says so instead of guessing.
+    """
     config.ensure_directories()
     dedup = DedupManager(config.dedup_file)
+    script_path = Path(__file__).resolve()
+    own_code_mtime = script_path.stat().st_mtime
     logger.info(f"Starting Rich Notes Bridge daemon...")
     logger.info(f"Watching inbox : {config.inbox_dir}")
     logger.info(f"Outbox results : {config.outbox_dir}")
     logger.info(f"Archive folder : {config.archive_dir}")
+    logger.info(f"Running code from {script_path} (mtime {own_code_mtime})")
 
     while True:
         try:
             scan_and_process_inbox(config, dedup)
         except Exception as e:
             logger.error(f"Error in watcher loop: {e}", exc_info=True)
+
+        try:
+            current_mtime = script_path.stat().st_mtime
+        except Exception:
+            current_mtime = own_code_mtime  # script briefly missing mid-save; don't false-trigger
+
+        if current_mtime > own_code_mtime:
+            logger.warning(
+                f"{script_path.name} was edited since this watcher started "
+                f"(now mtime {current_mtime}, started with {own_code_mtime}) — "
+                "this process is running stale code. Exiting so launchd (KeepAlive) "
+                "restarts it fresh; if running in the foreground, restart it manually."
+            )
+            return
+
         time.sleep(poll_interval)
 
 
@@ -1496,6 +1533,7 @@ def check_status(config: BridgeConfig):
         res = subprocess.run(["launchctl", "list", LAUNCH_AGENT_LABEL], capture_output=True, text=True)
         if res.returncode == 0:
             print(f"LaunchAgent      : LOADED ({LAUNCH_AGENT_LABEL})")
+            print(_watcher_freshness_line(res.stdout))
         else:
             print(f"LaunchAgent      : INSTALLED BUT NOT LOADED")
     else:
@@ -1503,6 +1541,43 @@ def check_status(config: BridgeConfig):
 
     dedup = DedupManager(config.dedup_file)
     print(f"Processed Notes  : {len(dedup.data.get('by_id', {}))} recorded in state")
+
+
+def _watcher_freshness_line(launchctl_list_output: str) -> str:
+    """
+    Builds the "Watcher Code" status line: compares the running watcher
+    process's actual start time against the script's current mtime, as a
+    passive, human-visible complement to run_daemon_loop's own self-healing
+    exit-on-edit check (this just reports; it has no ability to fix anything
+    — useful when the watcher is deliberately run in the foreground with no
+    launchd/KeepAlive to do the restarting).
+    """
+    pid_match = re.search(r'"PID"\s*=\s*(\d+);', launchctl_list_output)
+    if not pid_match:
+        return "Watcher Code     : not currently running (no PID in launchctl list)"
+    pid = pid_match.group(1)
+
+    try:
+        script_mtime = Path(__file__).resolve().stat().st_mtime
+    except Exception as e:
+        return f"Watcher Code     : could not stat script file: {e}"
+
+    ps_res = subprocess.run(["ps", "-o", "lstart=", "-p", pid], capture_output=True, text=True)
+    if ps_res.returncode != 0 or not ps_res.stdout.strip():
+        return f"Watcher Code     : running (pid {pid}), but couldn't read its start time"
+
+    try:
+        proc_start = datetime.datetime.strptime(ps_res.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
+    except ValueError as e:
+        return f"Watcher Code     : running (pid {pid}), but couldn't parse start time: {e}"
+
+    if proc_start < script_mtime:
+        return (
+            f"Watcher Code     : STALE — pid {pid} started before the script's last edit "
+            f"(the self-healing check in run_daemon_loop should restart it within "
+            f"~1 poll cycle; if it hasn't, see TROUBLESHOOTING in README.md)"
+        )
+    return f"Watcher Code     : fresh (pid {pid} started after the script's last edit)"
 
 
 # ----------------------------------------------------------------------

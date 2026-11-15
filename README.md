@@ -179,6 +179,36 @@ commands:
 
 ---
 
+## Troubleshooting
+
+### A dropped request produced the wrong thing (e.g. an export produced an "Untitled Note")
+
+This almost always means the resident `run`/`daemon` process is older than your code — like any long-running interpreted process, it keeps whatever was on disk at the moment it started until it restarts; editing the script does not change what an already-running process does.
+
+As of this version, the watcher is **self-healing**: it checks its own running code's mtime against the script's current mtime every poll cycle, and if they've drifted, it logs a warning and exits cleanly. Under the LaunchAgent (`install`), `KeepAlive` then restarts it automatically — typically within ~10 seconds of saving an edit, no manual steps needed. Running in the foreground (`run`, no launchd) has no `KeepAlive` to restart it, so it just exits with the same warning and needs a manual re-launch.
+
+To check directly:
+```bash
+./rich_notes_bridge.py status
+```
+Look at the `Watcher Code` line — `STALE` means a restart is overdue (should self-correct within a few seconds if running under `install`); `fresh` means you're good.
+
+If it's stuck `STALE` (self-heal isn't firing — e.g. the loop itself hung on a prior bug), force it:
+```bash
+launchctl kickstart -k gui/$(id -u)/com.rich-notes-bridge.agent
+```
+
+### Two LaunchAgents running at once
+
+This bridge's `LAUNCH_AGENT_LABEL` constant changed once (`com.conner.rich-notes-bridge` → `com.rich-notes-bridge.agent`) without the old plist ever being uninstalled, which left **two** watchers loaded simultaneously, both racing to process the same inbox. Confirm there's exactly one:
+```bash
+launchctl list | grep rich-notes-bridge
+ls ~/Library/LaunchAgents/ | grep rich-notes-bridge
+```
+If you see more than one label, `uninstall` won't help (it only ever manages the *current* label's plist) — `launchctl bootout gui/$(id -u)/<old-label>` and delete that plist file by hand, then `./rich_notes_bridge.py install` for a clean single instance.
+
+---
+
 ## Security & Privacy
 
 - **100% Offline**: Zero external network access or remote telemetry.
