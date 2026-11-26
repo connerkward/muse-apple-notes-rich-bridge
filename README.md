@@ -159,12 +159,29 @@ Write `~/.rich-notes-bridge/inbox/<request_id>.json` with `"op": "export"` inste
 
 The bridge writes the note's full plaintext and HTML to `outbox/<id>.body.txt` and `outbox/<id>.body.html` (no size cap — read them via file transfer, not the connector's own Notes read path), plus a `outbox/<id>.json` receipt. If `note_id` is `null`, the note is looked up by exact `title` instead — zero matches or more than one match both error out rather than guessing (an ambiguous match lists every candidate note ID in the receipt's `candidates` field). **Export is strictly read-only** (never creates, modifies, or deletes a note) and is **never blocked by the create-dedup mechanism** — re-dropping the same export `id` always re-reads the note fresh, since it may have been edited since the last export. Full schema and error cases: [`PROTOCOL.md`](PROTOCOL.md).
 
+### Adding Attachments to an Existing Note
+
+Drop `inbox/<request_id>.json` with `"op": "attach"`, a target `note_id` (or exact `title` + `folder`), and `attachments`:
+
+```json
+{
+  "id": "attach-fix-20261126",
+  "op": "attach",
+  "note_id": "x-coredata://XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX/ICNote/p9450",
+  "attachments": {"clip.m4a": "<base64 or relative path>"}
+}
+```
+
+The files are appended to the end of the note; the receipt's `attachments_count` is the note's new total, `attachments_added` lists what this request added. See [`PROTOCOL.md` §7](PROTOCOL.md).
+
+**Attachments are never silently dropped.** For create and attach alike, a referenced file that doesn't exist or base64 that doesn't decode makes the whole request fail (`"status": "error"`, entry named in `error`, no note created/modified). Audio/video blobs without a filename extension are detected (M4A, MP4, MOV, MP3, WAV, FLAC, OGG, HEIC, …); unknown types become `.bin`, never a fake `.png`.
+
 ---
 
 ## CLI Reference
 
 ```
-usage: rich_notes_bridge.py [-h] [--dir DIR] [-v] {run,daemon,process,once,install,uninstall,status,test} ...
+usage: rich_notes_bridge.py [-h] [--dir DIR] [-v] {run,daemon,process,once,install,uninstall,status,test,unit-test} ...
 
 commands:
   run (daemon)       Run the watcher loop in the foreground
@@ -172,7 +189,9 @@ commands:
   install            Install and load the launchd background agent
   uninstall          Unload and remove the launchd background agent
   status             Show bridge status, queue counts, and launchd health
-  test               Run end-to-end self tests (image attachment + export round trip)
+  test               Run all self tests: offline unit tests, image attachment,
+                     audio (.m4a via afconvert) + .mp4 attachment, export round trip
+  unit-test          Offline unit tests only (no Notes.app; runs on any OS)
 ```
 
 `--dir`/`-v` work in any position (`rich_notes_bridge.py --dir <path> test` or `rich_notes_bridge.py test --dir <path>` both honor the override).

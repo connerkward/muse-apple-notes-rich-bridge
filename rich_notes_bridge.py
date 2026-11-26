@@ -141,34 +141,126 @@ class DedupManager:
 # ----------------------------------------------------------------------
 # Image & Attachment Utilities
 # ----------------------------------------------------------------------
-def detect_file_extension(data: bytes, fallback: str = ".png") -> str:
-    """Detect file extension from magic bytes for common media and docs."""
+# ISO Base Media File Format (ISO/IEC 14496-12) brand -> extension. Covers the
+# MPEG-4 family (QuickTime, MP4, M4A/M4B audio, HEIF/HEIC). Checked against the
+# major brand first, then the compatible-brands list (some muxers write a
+# generic major brand like "isom" with the specific one only in the compat list).
+_FTYP_BRANDS = {
+    b"M4A ": ".m4a",
+    b"M4B ": ".m4a",
+    b"qt  ": ".mov",
+    b"heic": ".heic",
+    b"heix": ".heic",
+    b"mif1": ".heic",
+    b"msf1": ".heic",
+    b"isom": ".mp4",
+    b"iso2": ".mp4",
+    b"mp41": ".mp4",
+    b"mp42": ".mp4",
+    b"avc1": ".mp4",
+    b"dash": ".mp4",
+    b"M4V ": ".mp4",
+}
+
+
+def _detect_ftyp_extension(data: bytes) -> Optional[str]:
+    if len(data) < 12 or data[4:8] != b"ftyp":
+        return None
+    ext = _FTYP_BRANDS.get(data[8:12])
+    if ext:
+        return ext
+    # Compatible brands: 4-byte entries from offset 16 to the end of the ftyp box.
+    box_size = int.from_bytes(data[0:4], "big")
+    end = min(box_size if box_size >= 16 else 16, len(data))
+    for off in range(16, end - 3, 4):
+        ext = _FTYP_BRANDS.get(data[off:off + 4])
+        if ext:
+            return ext
+    return None
+
+
+def detect_file_extension(data: bytes, fallback: str = ".bin") -> str:
+    """
+    Detect file extension from magic bytes for common media and docs.
+
+    Unknown types fall back to ".bin" (previously ".png", which turned any
+    unnamed audio/video blob into a corrupt image attachment). ZIP-container
+    formats (.docx/.xlsx/.pages/...) are indistinguishable from .zip by magic
+    bytes alone; a real filename from the manifest always wins upstream, so
+    detection only runs for nameless / extensionless entries.
+    """
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return ".png"
     if data.startswith(b"\xff\xd8\xff"):
         return ".jpg"
     if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
         return ".gif"
-    if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
-        return ".webp"
+    if data.startswith(b"RIFF") and len(data) >= 12:
+        riff_type = data[8:12]
+        if riff_type == b"WEBP":
+            return ".webp"
+        if riff_type == b"WAVE":
+            return ".wav"
+        if riff_type == b"AVI ":
+            return ".avi"
+    ftyp_ext = _detect_ftyp_extension(data)
+    if ftyp_ext:
+        return ftyp_ext
     if data.startswith(b"%PDF"):
         return ".pdf"
     if data.startswith(b"PK\x03\x04"):
         return ".zip"
     if data.startswith(b"MM\x00*") or data.startswith(b"II*\x00"):
         return ".tiff"
+    if data.startswith(b"fLaC"):
+        return ".flac"
+    if data.startswith(b"OggS"):
+        return ".ogg"
+    if data.startswith(b"ID3"):
+        return ".mp3"
+    # MPEG audio frame sync: 11 set bits. Checked after JPEG (FF D8 does not
+    # satisfy the 0xE0 mask, so there is no overlap either way).
+    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
+        # Layer bits == 00 with a 12-bit sync is AAC ADTS, not MPEG layer I-III.
+        if (data[1] & 0xF6) == 0xF0:
+            return ".aac"
+        return ".mp3"
     if data.startswith(b"BM"):
         return ".bmp"
     return fallback
 
 
 def decode_base64_string(raw: str) -> bytes:
-    """Clean and decode base64 string, handling data URIs and whitespace."""
+    """
+    Clean and decode base64 string, handling data URIs and whitespace.
+
+    Strict: any character outside the base64 alphabet (after whitespace is
+    removed) raises ValueError. The stdlib default (validate=False) silently
+    discards such characters, which let a nonexistent file path like
+    "clips/stoats.m4a" decode into a few bytes of garbage that were then
+    attached as if they were the real file. URL-safe alphabet (-_) and missing
+    padding are accepted.
+    """
     s = raw.strip()
     if s.startswith("data:") and ";base64," in s:
         s = s.split(";base64,", 1)[1]
     s = re.sub(r"\s+", "", s)
-    return base64.b64decode(s)
+    if "-" in s or "_" in s:
+        s = s.replace("-", "+").replace("_", "/")
+    s = s.rstrip("=")
+    if len(s) % 4 == 1:
+        raise ValueError("invalid base64 length")
+    s += "=" * (-len(s) % 4)
+    try:
+        return base64.b64decode(s, validate=True)
+    except Exception as e:
+        raise ValueError(f"invalid base64: {e}") from e
+
+
+class AttachmentLoadError(ValueError):
+    """A manifest referenced an attachment that could not be loaded (missing
+    file, undecodable base64, empty value). Always a hard failure: the request
+    errors and no note is created/modified (never a silent partial success)."""
 
 
 # ----------------------------------------------------------------------
@@ -380,6 +472,10 @@ class RichNoteRequest:
         self.format_type = format_type.lower() if format_type else "auto"
         self.attachments = attachments  # filename -> decoded bytes
         self.raw_source_path = raw_source_path
+        # Keys of `attachments` whose name was synthesized by the parser (not
+        # sent), mapped to a staging-filename hint or None. Not part of the
+        # content hash. See _extract_attachments.
+        self.auto_named: Dict[str, Optional[str]] = {}
 
     def compute_content_hash(self) -> str:
         """Deterministic SHA-256 hash of content for deduplication."""
@@ -409,6 +505,60 @@ class ExportRequest:
         self.raw_source_path = raw_source_path
 
 
+class AttachRequest:
+    """
+    "op": "attach" — append attachments to an EXISTING note. Target by
+    `note_id` (x-coredata://... id, or the note's UUID identifier, mapped via
+    the Notes SQLite store), or fall back to exact `title` (+ optional
+    `folder`) that must match exactly one note.
+    """
+
+    def __init__(
+        self,
+        request_id: str,
+        note_id: Optional[str],
+        title: Optional[str],
+        folder: Optional[str],
+        attachments: Dict[str, bytes],
+        auto_named: Dict[str, Optional[str]],
+        force: bool,
+        raw_source_path: Path,
+    ):
+        self.request_id = request_id
+        self.note_id = (note_id or "").strip() or None
+        self.title = title or None
+        self.folder = folder or None
+        self.attachments = attachments
+        self.auto_named = auto_named
+        self.force = force
+        self.raw_source_path = raw_source_path
+
+    def compute_content_hash(self) -> str:
+        """Hash of target + attachment bytes. Prefixed "attach:" when stored so
+        it can never collide with a create request's content hash."""
+        h = hashlib.sha256()
+        h.update(b"attach|")
+        h.update((self.note_id or "").encode("utf-8"))
+        h.update(b"|")
+        h.update((self.folder or "").strip().encode("utf-8"))
+        h.update(b"|")
+        h.update((self.title or "").strip().encode("utf-8"))
+        for name in sorted(self.attachments.keys()):
+            h.update(b"|att:")
+            h.update(name.encode("utf-8"))
+            h.update(b":")
+            h.update(hashlib.sha256(self.attachments[name]).digest())
+        return h.hexdigest()
+
+
+def _manifest_path_for_dir(dir_path: Path) -> Optional[Path]:
+    for cand in ("manifest.json", "request.json"):
+        p = dir_path / cand
+        if p.is_file():
+            return p
+    return None
+
+
 def _detect_op(item_path: Path, orig_name: str) -> str:
     """Peeks at a single-JSON-file request's "op" field without fully parsing it
     as a create request. Returns "create" (the default) for directories,
@@ -416,7 +566,18 @@ def _detect_op(item_path: Path, orig_name: str) -> str:
     every one of those cases the existing create pipeline's own error handling
     is what should run, unchanged, exactly as before this field existed."""
     if item_path.is_dir():
-        return "create"
+        # Directory drops: only "attach" is recognized from manifest.json; every
+        # other value keeps the historical behavior (directory = create).
+        mp = _manifest_path_for_dir(item_path)
+        if not mp:
+            return "create"
+        try:
+            with open(mp, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            op = str(meta.get("op") or "create").lower() if isinstance(meta, dict) else "create"
+            return "attach" if op == "attach" else "create"
+        except Exception:
+            return "create"
     if Path(orig_name).suffix.lower() != ".json":
         return "create"
     try:
@@ -425,6 +586,62 @@ def _detect_op(item_path: Path, orig_name: str) -> str:
         return str(meta.get("op") or "create").lower()
     except Exception:
         return "create"
+
+
+def _peek_request_id(item_path: Path, default_id: str) -> Optional[str]:
+    """Best-effort read of a create request's "id" without loading attachments."""
+    try:
+        if item_path.is_dir():
+            mp = _manifest_path_for_dir(item_path)
+            if mp:
+                with open(mp, "r", encoding="utf-8") as f:
+                    return json.load(f).get("id") or default_id
+            return default_id
+        if item_path.name.replace(".processing", "").lower().endswith(".json"):
+            with open(item_path, "r", encoding="utf-8") as f:
+                return json.load(f).get("id") or default_id
+        if item_path.name.replace(".processing", "").lower().endswith((".txt", ".md")):
+            with open(item_path, "r", encoding="utf-8") as f:
+                return _parse_frontmatter_text(f.read()).get("id") or default_id
+    except Exception:
+        pass
+    return default_id
+
+
+def _parse_attach_request(item_path: Path) -> AttachRequest:
+    if item_path.is_dir():
+        manifest = _manifest_path_for_dir(item_path)
+        if not manifest:
+            raise ValueError("attach directory has no manifest.json")
+        base_dir = item_path
+        orig_name = item_path.name
+    else:
+        manifest = item_path
+        base_dir = item_path.parent
+        orig_name = item_path.name
+    if orig_name.endswith(".processing"):
+        orig_name = orig_name[:-len(".processing")]
+
+    with open(manifest, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    req_id = meta.get("id") or (orig_name if item_path.is_dir() else Path(orig_name).stem)
+    attachments: Dict[str, bytes] = {}
+    auto_named: Dict[str, Optional[str]] = {}
+    for k in ["images", "attachments"]:
+        if k in meta:
+            _extract_attachments(meta[k], attachments, base_dir, key=k, auto_named=auto_named)
+
+    return AttachRequest(
+        request_id=req_id,
+        note_id=meta.get("note_id"),
+        title=meta.get("title"),
+        folder=meta.get("folder"),
+        attachments=attachments,
+        auto_named=auto_named,
+        force=bool(meta.get("force", False)),
+        raw_source_path=item_path,
+    )
 
 
 def _parse_export_request(json_path: Path) -> ExportRequest:
@@ -466,7 +683,7 @@ def parse_request_from_path(item_path: Path) -> Optional[RichNoteRequest]:
             logger.debug(f"Ignoring unrecognized file in inbox: {item_path.name}")
             return None
     except Exception as e:
-        logger.error(f"Error parsing request from {item_path}: {e}", exc_info=True)
+        logger.error(f"Error parsing request from {item_path}: {e}", exc_info=not isinstance(e, AttachmentLoadError))
         raise
 
 
@@ -480,6 +697,7 @@ def _parse_directory_request(dir_path: Path) -> RichNoteRequest:
     body = ""
     format_type = "auto"
     attachments: Dict[str, bytes] = {}
+    auto_named: Dict[str, Optional[str]] = {}
 
     manifest_candidates = [
         dir_path / "manifest.json",
@@ -507,7 +725,7 @@ def _parse_directory_request(dir_path: Path) -> RichNoteRequest:
 
         for k in ["images", "attachments"]:
             if k in meta:
-                _extract_attachments(meta[k], attachments, dir_path)
+                _extract_attachments(meta[k], attachments, dir_path, key=k, auto_named=auto_named)
 
     elif manifest_path:
         with open(manifest_path, "r", encoding="utf-8") as f:
@@ -529,7 +747,8 @@ def _parse_directory_request(dir_path: Path) -> RichNoteRequest:
                     with open(f, "r", encoding="utf-8") as bf:
                         attachments[clean_name] = decode_base64_string(bf.read())
                 except Exception as e:
-                    logger.warning(f"Failed to decode base64 file {f.name}: {e}")
+                    # Previously a logged warning + silent drop; now a hard failure.
+                    raise AttachmentLoadError(f"Companion base64 file {f.name!r} failed to decode: {e}") from e
             else:
                 try:
                     with open(f, "rb") as bf:
@@ -541,10 +760,10 @@ def _parse_directory_request(dir_path: Path) -> RichNoteRequest:
                             attachments[f.name] = raw_bytes
                     else:
                         attachments[f.name] = raw_bytes
-                except Exception as e:
-                    logger.warning(f"Failed to read companion file {f.name}: {e}")
+                except OSError as e:
+                    raise AttachmentLoadError(f"Companion file {f.name!r} could not be read: {e}") from e
 
-    return RichNoteRequest(
+    req = RichNoteRequest(
         request_id=req_id,
         title=title,
         folder=folder,
@@ -553,6 +772,8 @@ def _parse_directory_request(dir_path: Path) -> RichNoteRequest:
         attachments=attachments,
         raw_source_path=dir_path,
     )
+    req.auto_named = auto_named
+    return req
 
 
 def _parse_json_file_request(json_path: Path) -> RichNoteRequest:
@@ -569,12 +790,13 @@ def _parse_json_file_request(json_path: Path) -> RichNoteRequest:
     body = meta.get("body", "")
     format_type = meta.get("format", "auto")
     attachments: Dict[str, bytes] = {}
+    auto_named: Dict[str, Optional[str]] = {}
 
     for k in ["images", "attachments"]:
         if k in meta:
-            _extract_attachments(meta[k], attachments, json_path.parent)
+            _extract_attachments(meta[k], attachments, json_path.parent, key=k, auto_named=auto_named)
 
-    return RichNoteRequest(
+    req = RichNoteRequest(
         request_id=req_id,
         title=title,
         folder=folder,
@@ -583,6 +805,8 @@ def _parse_json_file_request(json_path: Path) -> RichNoteRequest:
         attachments=attachments,
         raw_source_path=json_path,
     )
+    req.auto_named = auto_named
+    return req
 
 
 def _parse_text_file_request(txt_path: Path) -> RichNoteRequest:
@@ -615,8 +839,8 @@ def _parse_text_file_request(txt_path: Path) -> RichNoteRequest:
                     attachments[clean_name] = decode_base64_string(raw.decode("utf-8"))
                 except Exception:
                     attachments[clean_name] = raw
-            except Exception as e:
-                logger.warning(f"Failed decoding companion file {cand}: {e}")
+            except OSError as e:
+                raise AttachmentLoadError(f"Companion file {cand.name!r} could not be read: {e}") from e
 
     return RichNoteRequest(
         request_id=req_id,
@@ -629,36 +853,118 @@ def _parse_text_file_request(txt_path: Path) -> RichNoteRequest:
     )
 
 
-def _extract_attachments(obj: Any, out_dict: Dict[str, bytes], base_dir: Path):
+# A string that is a path reference rather than base64. The base64 alphabet
+# (standard or URL-safe) never contains ".", "~" or "\\", so any of
+# those means "this was meant as a filename". Note "/" alone proves nothing:
+# JPEG base64 begins "/9j/".
+_PATHLIKE_RE = re.compile(r"[.~\\]")
+# Inline base64 shorter than this cannot be a real attachment (a 1x1 PNG is ~90
+# chars). Without this floor a dotless missing path like "clips/audio" is
+# valid base64 and would decode into 8 bytes of garbage.
+_MIN_INLINE_B64_CHARS = 24
+
+
+def _load_attachment_value(name: str, val: Any, base_dir: Path, key: str) -> bytes:
+    """
+    Resolves one manifest attachment value to bytes: an existing file path
+    (relative to the manifest; the file itself may contain base64 text or raw
+    bytes) or an inline base64 / data-URI string. Raises AttachmentLoadError
+    naming the entry on anything that can't be loaded — never returns empty or
+    garbage bytes for a reference that didn't resolve.
+    """
+    label = f"{key}[{name!r}]"
+    if not isinstance(val, str) or not val.strip():
+        raise AttachmentLoadError(f"Attachment {label} has no data/path value")
+    try:
+        possible_file = (base_dir / os.path.expanduser(val.strip()))
+        is_file = possible_file.is_file()
+    except (OSError, ValueError):
+        # e.g. a multi-KB base64 string exceeds the OS path-length limit.
+        is_file = False
+    if is_file:
+        try:
+            with open(possible_file, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            raise AttachmentLoadError(f"Attachment {label}: cannot read file {val!r}: {e}") from e
+        if not raw:
+            raise AttachmentLoadError(f"Attachment {label}: file {val!r} is empty")
+        try:
+            decoded = decode_base64_string(raw.decode("utf-8"))
+            return decoded if decoded else raw
+        except Exception:
+            return raw
+    stripped = val.strip()
+    compact = re.sub(r"\s+", "", stripped)
+    if not stripped.startswith("data:") and (
+        (_PATHLIKE_RE.search(compact) and len(compact) < 4096)
+        or len(compact) < _MIN_INLINE_B64_CHARS
+    ):
+        raise AttachmentLoadError(
+            f"Attachment {label}: file not found: {val!r} (resolved relative to {base_dir})"
+        )
+    try:
+        data = decode_base64_string(val)
+    except Exception as e:
+        raise AttachmentLoadError(
+            f"Attachment {label}: value is neither an existing file path nor valid base64 ({e})"
+        ) from e
+    if not data:
+        raise AttachmentLoadError(f"Attachment {label}: base64 decoded to zero bytes")
+    return data
+
+
+def _extract_attachments(
+    obj: Any,
+    out_dict: Dict[str, bytes],
+    base_dir: Path,
+    key: str = "attachments",
+    auto_named: Optional[Dict[str, Optional[str]]] = None,
+):
+    """
+    Loads every entry of a manifest's images/attachments value into out_dict.
+    Any entry that cannot be loaded raises AttachmentLoadError (Fix 2: never
+    silently drop).
+
+    `auto_named` maps each key whose filename was synthesized here (rather
+    than supplied by the sender) to a better staging filename hint (the
+    basename of its "path", or None). The synthesized key itself keeps its
+    historical "attachment_N.png" form so content hashes — and therefore dedup
+    — of pre-existing manifests are unchanged; staging uses the hint or
+    re-detects the real type instead of trusting the placeholder ".png".
+    """
+    if obj is None:
+        return
     if isinstance(obj, dict):
         for name, val in obj.items():
-            if isinstance(val, str):
-                possible_file = base_dir / val
-                if possible_file.is_file():
-                    with open(possible_file, "rb") as f:
-                        raw = f.read()
-                    try:
-                        out_dict[name] = decode_base64_string(raw.decode("utf-8"))
-                    except Exception:
-                        out_dict[name] = raw
-                else:
-                    out_dict[name] = decode_base64_string(val)
+            out_dict[name] = _load_attachment_value(name, val, base_dir, key)
     elif isinstance(obj, list):
         for idx, item in enumerate(obj):
-            if isinstance(item, dict):
-                name = item.get("name") or item.get("filename") or f"attachment_{idx+1}.png"
-                val = item.get("data") or item.get("base64") or item.get("path")
-                if val and isinstance(val, str):
-                    possible_file = base_dir / val
-                    if possible_file.is_file():
-                        with open(possible_file, "rb") as f:
-                            raw = f.read()
-                        try:
-                            out_dict[name] = decode_base64_string(raw.decode("utf-8"))
-                        except Exception:
-                            out_dict[name] = raw
-                    else:
-                        out_dict[name] = decode_base64_string(val)
+            item_key = f"{key}[{idx}]"
+            if isinstance(item, str):
+                # Bare string entries were previously ignored outright (a silent
+                # drop). Now: a path (named by its basename) or inline base64.
+                s_item = re.sub(r"\s+", "", item)
+                if _PATHLIKE_RE.search(s_item) and len(s_item) < 4096:
+                    name = Path(item.strip()).name
+                else:
+                    name = f"attachment_{idx+1}.png"
+                    if auto_named is not None:
+                        auto_named[name] = None
+                out_dict[name] = _load_attachment_value(name, item, base_dir, item_key)
+                continue
+            if not isinstance(item, dict):
+                raise AttachmentLoadError(f"{item_key} is not an object or string: {type(item).__name__}")
+            val = item.get("data") or item.get("base64") or item.get("path")
+            name = item.get("name") or item.get("filename")
+            if not name:
+                name = f"attachment_{idx+1}.png"
+                if auto_named is not None:
+                    p = item.get("path")
+                    auto_named[name] = Path(p.strip()).name if isinstance(p, str) and p.strip() else None
+            out_dict[name] = _load_attachment_value(name, val, base_dir, item_key)
+    else:
+        raise AttachmentLoadError(f"{key} must be an object or a list, got {type(obj).__name__}")
 
 
 def _parse_frontmatter_text(raw_text: str) -> Dict[str, str]:
@@ -703,6 +1009,58 @@ def _parse_frontmatter_text(raw_text: str) -> Dict[str, str]:
 # ----------------------------------------------------------------------
 # HTML Synthesis & Attachment Staging
 # ----------------------------------------------------------------------
+def staged_attachment_name(orig_name: str, file_bytes: bytes, hint: Optional[str] = None, auto: bool = False) -> str:
+    """
+    Filename an attachment is staged (and therefore shown in Notes) under.
+    A sender-supplied name with a real extension always wins — magic-byte
+    detection only fills in missing/placeholder extensions, so e.g. a .docx
+    (ZIP container) named correctly is never relabeled .zip.
+    """
+    if auto:
+        if hint and Path(hint).suffix and Path(hint).suffix.lower() not in (".b64", ".base64", ".txt"):
+            return Path(hint).name
+        base = Path(hint).stem if hint else Path(orig_name).stem
+        return f"{base}{detect_file_extension(file_bytes)}"
+    safe_name = Path(orig_name).name
+    ext = Path(safe_name).suffix.lower()
+    if ext in [".b64", ".base64", ".txt", ""]:
+        safe_name = f"{Path(safe_name).stem}{detect_file_extension(file_bytes)}"
+    return safe_name
+
+
+def stage_attachments(attachments: Dict[str, bytes], scratch_dir: Path, auto_named: Optional[Dict[str, Optional[str]]] = None) -> List[Path]:
+    """
+    Writes each attachment into scratch_dir. Two entries that would stage to
+    the same filename (e.g. "a/x.png" and "b/x.png") are disambiguated with a
+    " (2)" suffix — previously the second silently overwrote the first, so
+    one attachment vanished while the request still reported success.
+    """
+    auto_named = auto_named or {}
+    staged_paths: List[Path] = []
+    used: set = set()
+    for orig_name, file_bytes in attachments.items():
+        safe_name = staged_attachment_name(
+            orig_name, file_bytes, hint=auto_named.get(orig_name), auto=orig_name in auto_named
+        )
+        if not safe_name or safe_name in (".", ".."):
+            safe_name = f"attachment{detect_file_extension(file_bytes)}"
+        candidate = safe_name
+        n = 2
+        while candidate.lower() in used or candidate == "note_body.html":
+            candidate = f"{Path(safe_name).stem} ({n}){Path(safe_name).suffix}"
+            n += 1
+        used.add(candidate.lower())
+        out_path = scratch_dir / candidate
+        with open(out_path, "wb") as f:
+            f.write(file_bytes)
+        staged_paths.append(out_path)
+    if len(staged_paths) != len(attachments):
+        raise AttachmentLoadError(
+            f"Staged {len(staged_paths)} of {len(attachments)} attachments — refusing a partial note"
+        )
+    return staged_paths
+
+
 def prepare_note_html_and_attachments(
     req: RichNoteRequest, scratch_dir: Path
 ) -> Tuple[str, List[Path]]:
@@ -710,21 +1068,8 @@ def prepare_note_html_and_attachments(
     Stages all attachments into scratch_dir (/tmp) and prepares the rich
     HTML body for Apple Notes. Returns (html_body, list_of_staged_file_paths).
     """
-    staged_paths: List[Path] = []
-
     # 1. Save all decoded attachments into scratch_dir (/tmp)
-    for orig_name, file_bytes in req.attachments.items():
-        safe_name = Path(orig_name).name
-        ext = Path(safe_name).suffix.lower()
-        if ext in [".b64", ".base64", ".txt", ""]:
-            safe_name = f"{Path(safe_name).stem}{detect_file_extension(file_bytes)}"
-
-        out_path = scratch_dir / safe_name
-        with open(out_path, "wb") as f:
-            f.write(file_bytes)
-
-        if out_path not in staged_paths:
-            staged_paths.append(out_path)
+    staged_paths = stage_attachments(req.attachments, scratch_dir, getattr(req, "auto_named", None))
 
     # 2. Convert body to HTML
     body_str = req.body or ""
@@ -741,7 +1086,21 @@ def prepare_note_html_and_attachments(
     else:
         html_content = markdown_to_html(body_str)
 
-    # Remove any stray <img src="..."> tags from HTML body so Notes doesn't fail URL loading
+    # Remove any stray <img src="..."> tags from HTML body so Notes doesn't fail URL loading.
+    #
+    # LIMITATION (investigated; inline image placement is not possible here):
+    # Notes' AppleScript dictionary exposes exactly one way to add a real
+    # attachment — `make new attachment at <note> with data <file>` — and it
+    # always appends at the end of the note; there is no insertion-location
+    # parameter, and `attachment` objects have no settable position. Setting
+    # `body` to HTML containing <img src="file://..."> or a data: URI does not
+    # create an attachment (Notes drops or fails the external load), and any
+    # later write to `body` on a note that already has attachments rewrites
+    # the HTML and can detach/duplicate them. "Segmented" construction (write
+    # body part 1, attach, append body part 2) therefore cannot work: the
+    # second body write replaces the whole body, it does not append after the
+    # attachment. So images stay as end-of-note attachments and each <img>
+    # becomes a "📷 <alt>" placeholder line marking where it was referenced.
     html_content = re.sub(r'<img[^>]*alt=["\'](.*?)["\'][^>]*>', r'<div><i>📷 \1</i></div>', html_content)
     html_content = re.sub(r'<img[^>]*>', r'', html_content)
 
@@ -808,13 +1167,30 @@ def execute_applescript_create_note(
         '    set theNote to make new note at theFolder with properties {body:bodyText}',
     ]
 
+    # Each attachment is added inside a try: if Notes refuses any one of them,
+    # the half-built note is deleted and the script reports which file failed,
+    # so a request never ends as a note silently missing some attachments.
     for att_path in attachment_paths:
-        script_lines.append(f'    make new attachment at theNote with data (POSIX file "{att_path.resolve()}")')
+        safe_att = _escape_applescript_string(str(att_path.resolve()))
+        script_lines.extend([
+            '    try',
+            f'        make new attachment at theNote with data (POSIX file "{safe_att}")',
+            '    on error errMsg',
+            '        try',
+            '            delete theNote',
+            '        end try',
+            f'        return "ATTACH_ERROR" & tab & "{_escape_applescript_string(att_path.name)}" & tab & errMsg',
+            '    end try',
+        ])
 
     script_lines.extend([
         '    set noteId to id of theNote',
         '    set noteName to name of theNote',
-        '    return noteId & "\\t" & noteName',
+        '    set attCount to 0',
+        '    try',
+        '        set attCount to count of attachments of theNote',
+        '    end try',
+        '    return noteId & "\\t" & noteName & "\\t" & (attCount as string)',
         'end tell',
     ])
 
@@ -831,13 +1207,36 @@ def execute_applescript_create_note(
         raise RuntimeError("Notes.app automation returned empty response")
 
     parts = output_str.split("\t")
+    if parts[0] == "ATTACH_ERROR":
+        failed = parts[1] if len(parts) > 1 else "?"
+        detail = parts[2] if len(parts) > 2 else ""
+        raise RuntimeError(f"Notes.app refused attachment {failed!r}: {detail} (note was rolled back)")
     note_id = parts[0]
     note_name = parts[1] if len(parts) > 1 else title
+    notes_count: Optional[int] = None
+    if len(parts) > 2:
+        try:
+            notes_count = int(parts[2])
+        except ValueError:
+            notes_count = None
+
+    if notes_count is not None and notes_count < len(attachment_paths):
+        # Notes accepted every `make new attachment` yet reports fewer: treat
+        # as failure rather than report a success the sender can't trust.
+        subprocess.run(
+            ["osascript", "-e", f'tell application "Notes" to delete note id "{_escape_applescript_string(note_id)}"'],
+            capture_output=True, text=True,
+        )
+        raise RuntimeError(
+            f"Notes.app reports {notes_count} attachment(s) after adding {len(attachment_paths)} "
+            "(note was rolled back)"
+        )
 
     return {
         "id": note_id,
         "name": note_name,
         "attachments_count": len(attachment_paths),
+        "notes_attachments_count": notes_count,
         "folder": folder,
     }
 
@@ -916,6 +1315,243 @@ def resolve_note_id_by_title(title: str) -> Dict[str, Any]:
     if status == "ERROR":
         return {"status": "ERROR", "error": parts[1] if len(parts) > 1 else "unknown error"}
     return {"status": "ERROR", "error": f"Unrecognized automation response: {out!r}"}
+
+
+# ----------------------------------------------------------------------
+# Apple Notes Automation — Attach to an existing note
+# ----------------------------------------------------------------------
+NOTES_GROUP_CONTAINER = Path(os.path.expanduser("~/Library/Group Containers/group.com.apple.notes"))
+NOTES_SQLITE_PATH = NOTES_GROUP_CONTAINER / "NoteStore.sqlite"
+_UUID_RE = re.compile(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
+
+
+def _coredata_id_from_note_uuid(note_uuid: str, db_path: Path = NOTES_SQLITE_PATH) -> Optional[str]:
+    """
+    Maps a note's UUID (ZICCLOUDSYNCINGOBJECT.ZIDENTIFIER — the form seen in
+    applenotes:/notes:// share links) to the x-coredata://<store-uuid>/ICNote/p<pk>
+    id AppleScript understands. Read-only SQLite access (stdlib sqlite3,
+    mode=ro). Returns None when the store is unreadable (no Full Disk Access
+    for the launchd python, schema change) or the UUID isn't an ICNote; the
+    caller then falls back to title/folder resolution.
+    """
+    import sqlite3
+
+    if not db_path.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+    except Exception as e:
+        logger.debug(f"Notes store not readable ({e}); UUID mapping unavailable")
+        return None
+    try:
+        store_uuid_row = con.execute("SELECT Z_UUID FROM Z_METADATA LIMIT 1").fetchone()
+        ent_row = con.execute("SELECT Z_ENT FROM Z_PRIMARYKEY WHERE Z_NAME = 'ICNote'").fetchone()
+        if not store_uuid_row or not ent_row:
+            return None
+        pk_row = con.execute(
+            "SELECT Z_PK FROM ZICCLOUDSYNCINGOBJECT WHERE ZIDENTIFIER = ? AND Z_ENT = ?",
+            (note_uuid.upper(), ent_row[0]),
+        ).fetchone()
+        if not pk_row:
+            pk_row = con.execute(
+                "SELECT Z_PK FROM ZICCLOUDSYNCINGOBJECT WHERE ZIDENTIFIER = ? AND Z_ENT = ?",
+                (note_uuid, ent_row[0]),
+            ).fetchone()
+        if not pk_row:
+            return None
+        return f"x-coredata://{store_uuid_row[0]}/ICNote/p{pk_row[0]}"
+    except Exception as e:
+        logger.debug(f"Notes store UUID lookup failed: {e}")
+        return None
+    finally:
+        con.close()
+
+
+def _note_id_exists(note_id: str) -> bool:
+    safe = _escape_applescript_string(note_id)
+    script = f'tell application "Notes"\n try\n  set n to note id "{safe}"\n  return id of n\n on error\n  return "NOTFOUND"\n end try\nend tell'
+    res = subprocess.run(["osascript", "-"], input=script, capture_output=True, text=True)
+    return res.returncode == 0 and res.stdout.strip() not in ("", "NOTFOUND")
+
+
+def resolve_note_in_folder_by_title(title: str, folder: str) -> Dict[str, Any]:
+    """Exact-title match restricted to folders named `folder` (in any account).
+    Same return contract as resolve_note_id_by_title (OK/NOTFOUND/MULTI/ERROR),
+    with the same id de-duplication."""
+    safe_title = _escape_applescript_string(title)
+    safe_folder = _escape_applescript_string(folder)
+    script = f"""
+    tell application "Notes"
+        set idList to {{}}
+        try
+            set theFolders to every folder whose name is "{safe_folder}"
+        on error errMsg
+            return "ERROR" & tab & errMsg
+        end try
+        if (count of theFolders) is 0 then return "NOFOLDER"
+        repeat with f in theFolders
+            try
+                set matchingNotes to (every note of f whose name is "{safe_title}")
+                repeat with aNote in matchingNotes
+                    set thisId to (id of aNote)
+                    if thisId is not in idList then set end of idList to thisId
+                end repeat
+            end try
+        end repeat
+        set n to count of idList
+        if n is 0 then
+            return "NOTFOUND"
+        else if n is 1 then
+            return "OK" & tab & (item 1 of idList)
+        else
+            set AppleScript's text item delimiters to "{_AS_LIST_SEP}"
+            set idJoined to idList as string
+            set AppleScript's text item delimiters to ""
+            return "MULTI" & tab & idJoined
+        end if
+    end tell
+    """
+    res = subprocess.run(["osascript", "-"], input=script, capture_output=True, text=True)
+    if res.returncode != 0:
+        return {"status": "ERROR", "error": res.stderr.strip() or f"osascript rc={res.returncode}"}
+    out = res.stdout.strip()
+    parts = out.split("\t", 1)
+    if parts[0] == "OK":
+        return {"status": "OK", "note_id": parts[1] if len(parts) > 1 else ""}
+    if parts[0] == "NOTFOUND":
+        return {"status": "NOTFOUND"}
+    if parts[0] == "NOFOLDER":
+        return {"status": "NOTFOUND", "error": f"no folder named {folder!r}"}
+    if parts[0] == "MULTI":
+        return {"status": "MULTI", "candidates": parts[1].split(_AS_LIST_SEP) if len(parts) > 1 else []}
+    if parts[0] == "ERROR":
+        return {"status": "ERROR", "error": parts[1] if len(parts) > 1 else "unknown error"}
+    return {"status": "ERROR", "error": f"Unrecognized automation response: {out!r}"}
+
+
+def resolve_attach_target(note_id: Optional[str], title: Optional[str], folder: Optional[str]) -> Dict[str, Any]:
+    """
+    Resolution order:
+      1. note_id "x-coredata://..." → used directly if Notes can open it.
+      2. note_id UUID → mapped through NoteStore.sqlite, then verified.
+      3. title (+ folder when given) → must match exactly one note.
+    Returns {"status": "OK", "note_id", "resolved_by"} or an error dict with
+    status NOTFOUND / MULTI / ERROR (+ "error", "candidates").
+    """
+    tried: List[str] = []
+    if note_id:
+        if note_id.startswith("x-coredata://"):
+            if _note_id_exists(note_id):
+                return {"status": "OK", "note_id": note_id, "resolved_by": "note_id"}
+            tried.append(f"note id {note_id!r} not found in Notes.app")
+        else:
+            bare = note_id
+            for prefix in ("applenotes:note/", "notes://showNote?identifier=", "notes://"):
+                if bare.startswith(prefix):
+                    bare = bare[len(prefix):]
+            bare = bare.split("?", 1)[0].strip("/")
+            if _UUID_RE.match(bare):
+                mapped = _coredata_id_from_note_uuid(bare)
+                if mapped and _note_id_exists(mapped):
+                    return {"status": "OK", "note_id": mapped, "resolved_by": "note_uuid"}
+                tried.append(
+                    f"note UUID {bare!r} could not be mapped via the Notes store"
+                    + (" (store unreadable — grant Full Disk Access to the bridge's python)" if not mapped else "")
+                )
+            elif _note_id_exists(note_id):
+                return {"status": "OK", "note_id": note_id, "resolved_by": "note_id"}
+            else:
+                tried.append(f"note id {note_id!r} not recognized")
+    if title:
+        lookup = resolve_note_in_folder_by_title(title, folder) if folder else resolve_note_id_by_title(title)
+        where = f" in folder {folder!r}" if folder else ""
+        if lookup["status"] == "OK":
+            return {"status": "OK", "note_id": lookup["note_id"], "resolved_by": "title_folder" if folder else "title"}
+        if lookup["status"] == "MULTI":
+            cands = lookup.get("candidates", [])
+            return {
+                "status": "MULTI",
+                "candidates": cands,
+                "error": f"{len(cands)} notes match title {title!r}{where} — provide note_id to disambiguate",
+            }
+        if lookup["status"] == "NOTFOUND":
+            tried.append(f"no note titled {title!r}{where}" + (f" ({lookup['error']})" if lookup.get("error") else ""))
+        else:
+            tried.append(f"title lookup failed: {lookup.get('error')}")
+    if not note_id and not title:
+        return {"status": "ERROR", "error": "attach request has neither note_id nor title — cannot identify the note"}
+    return {"status": "NOTFOUND", "error": "; ".join(tried) or "note not found"}
+
+
+def execute_applescript_attach_to_note(note_id: str, attachment_paths: List[Path]) -> Dict[str, Any]:
+    """
+    Appends files to an existing note with the same native handler the create
+    path uses ('make new attachment at theNote with data (POSIX file ...)').
+    Attachments land at the end of the note. Returns before/after counts and
+    the note's full attachment-name list. If Notes refuses a file midway,
+    raises with the names already added (those cannot be rolled back safely,
+    so the error says exactly what is now on the note).
+    """
+    safe_id = _escape_applescript_string(note_id)
+    lines = [
+        'tell application "Notes"',
+        '    try',
+        f'        set theNote to note id "{safe_id}"',
+        '    on error errMsg',
+        '        return "ERROR" & tab & "note not found: " & errMsg',
+        '    end try',
+        '    set beforeCount to count of attachments of theNote',
+        '    set addedCount to 0',
+    ]
+    for p in attachment_paths:
+        safe_p = _escape_applescript_string(str(p.resolve()))
+        lines.extend([
+            '    try',
+            f'        make new attachment at theNote with data (POSIX file "{safe_p}")',
+            '        set addedCount to addedCount + 1',
+            '    on error errMsg',
+            f'        return "PARTIAL" & tab & (addedCount as string) & tab & "{_escape_applescript_string(p.name)}" & tab & errMsg',
+            '    end try',
+        ])
+    lines.extend([
+        '    set afterCount to count of attachments of theNote',
+        '    set noteTitle to name of theNote',
+        '    set folderName to ""',
+        '    try',
+        '        set folderName to name of (container of theNote)',
+        '    end try',
+        '    set attNames to {}',
+        '    try',
+        '        set attNames to name of every attachment of theNote',
+        '    end try',
+        f'    set AppleScript\'s text item delimiters to "{_AS_LIST_SEP}"',
+        '    set attJoined to attNames as string',
+        '    set AppleScript\'s text item delimiters to ""',
+        '    return "OK" & tab & (beforeCount as string) & tab & (afterCount as string) & tab & noteTitle & tab & folderName & tab & attJoined',
+        'end tell',
+    ])
+    subprocess.run(["open", "-g", "-a", "Notes"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    res = subprocess.run(["osascript", "-"], input="\n".join(lines), capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"Notes.app attach automation error: {res.stderr.strip() or res.returncode}")
+    # rstrip newline only: the attachment-name list is the last field and may
+    # be empty, so a full strip() would eat the trailing tab separator.
+    out = res.stdout.rstrip("\r\n")
+    parts = out.split("\t")
+    if parts[0] == "ERROR":
+        raise RuntimeError(parts[1] if len(parts) > 1 else "unknown Notes.app error")
+    if parts[0] == "PARTIAL":
+        added = parts[1] if len(parts) > 1 else "0"
+        failed = parts[2] if len(parts) > 2 else "?"
+        detail = parts[3] if len(parts) > 3 else ""
+        raise RuntimeError(
+            f"Notes.app refused attachment {failed!r} after {added} of {len(attachment_paths)} were added: {detail}"
+        )
+    if parts[0] != "OK" or len(parts) < 6:
+        raise RuntimeError(f"Unrecognized attach automation response: {out!r}")
+    before, after = int(parts[1]), int(parts[2])
+    names = [a for a in parts[5].split(_AS_LIST_SEP) if a] if parts[5] else []
+    return {"before": before, "after": after, "title": parts[3], "folder": parts[4], "attachment_names": names}
 
 
 def execute_applescript_export_note(
@@ -1039,6 +1675,19 @@ def execute_applescript_export_note(
 # ----------------------------------------------------------------------
 # Request Processing Pipeline — Export (read-only, no dedup)
 # ----------------------------------------------------------------------
+# NOTE (stretch goal, intentionally NOT implemented): exporting attachment
+# binaries. The files live under ~/Library/Group Containers/
+# group.com.apple.notes/Media/<media-UUID>/.../<filename>, and the mapping is
+# note Z_PK → attachment rows (ZICCLOUDSYNCINGOBJECT.ZNOTE) → ZMEDIA → media
+# row ZIDENTIFIER → directory name. That chain is undocumented and varies:
+# (a) images/scans/drawings often have no Media file at all (FallbackImages/
+# Previews/ or Paper bundles instead); (b) the directory layout differs across
+# macOS releases (some versions nest an extra generation/UUID directory);
+# (c) iCloud-only attachments may not be downloaded locally; (d) reading the
+# store and the group container requires Full Disk Access for the launchd
+# python. It could not be verified against a live store when this was
+# written, and a mapping that silently exports the wrong or a partial file
+# set is worse than none, so export continues to report attachment NAMES only.
 def process_export_request(item_path: Path, config: BridgeConfig) -> Dict[str, Any]:
     """
     Processes a single "op": "export" request. Fully separate from the create
@@ -1173,6 +1822,147 @@ def process_export_request(item_path: Path, config: BridgeConfig) -> Dict[str, A
 
 
 # ----------------------------------------------------------------------
+# Request Processing Pipeline — Attach (append to an existing note)
+# ----------------------------------------------------------------------
+def process_attach_request(item_path: Path, config: BridgeConfig, dedup: DedupManager) -> Dict[str, Any]:
+    """
+    Processes "op": "attach". Validates every attachment BEFORE touching
+    Notes.app (an unloadable entry → error, note untouched). Deduped by request
+    id / content hash under an "attach:" namespace so a re-dropped manifest
+    does not append the same files twice; "force": true bypasses that.
+    Result: attachments_count is the note's NEW TOTAL attachment count;
+    attachments lists all attachment names now on the note; attachments_added
+    lists the staged names this request appended.
+    """
+    orig_name = item_path.name
+    if orig_name.endswith(".processing"):
+        orig_name = orig_name[:-len(".processing")]
+    req_id = Path(orig_name).stem if not item_path.is_dir() else orig_name
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    req: Optional[AttachRequest] = None
+    scratch_dir: Optional[Path] = None
+
+    def _result(status: str, **kw) -> Dict[str, Any]:
+        r = {
+            "id": req_id,
+            "status": status,
+            "op": "attach",
+            "note_id": kw.get("note_id", req.note_id if req else None),
+            "title": kw.get("title", req.title if req else None),
+            "folder": kw.get("folder", req.folder if req else None),
+            "attachments_count": kw.get("attachments_count", 0),
+            "attachments": kw.get("attachments", []),
+            "attachments_added": kw.get("attachments_added", []),
+            "attachments_added_count": len(kw.get("attachments_added", [])),
+            "attachments_count_before": kw.get("attachments_count_before"),
+            "resolved_by": kw.get("resolved_by"),
+            "processed_at": now_iso,
+            "error": kw.get("error"),
+        }
+        for extra in ("candidates", "message"):
+            if extra in kw:
+                r[extra] = kw[extra]
+        return r
+
+    def _fail(message: str, **kw) -> Dict[str, Any]:
+        logger.error(f"Attach request {req_id} failed: {message}")
+        r = _result("error", error=message, **kw)
+        _write_result(config, req_id, r)
+        _archive_request(item_path, config.archive_dir / "failed", req_id)
+        return r
+
+    try:
+        try:
+            req = _parse_attach_request(item_path)
+            req_id = req.request_id
+        except Exception as e:
+            return _fail(f"Failed to parse attach request: {e}")
+
+        if not req.attachments:
+            return _fail("attach request has no images/attachments entries")
+
+        dedup_id = f"attach:{req.request_id}"
+        content_hash = f"attach:{req.compute_content_hash()}"
+        if not req.force:
+            existing = dedup.check_duplicate(dedup_id, content_hash)
+            if existing:
+                r = _result(
+                    "duplicate",
+                    note_id=existing.get("note_id"),
+                    title=existing.get("title"),
+                    folder=existing.get("folder"),
+                    attachments_count=existing.get("attachments_count", 0),
+                    attachments=existing.get("attachments", []),
+                    attachments_added=existing.get("attachments_added", []),
+                    attachments_count_before=existing.get("attachments_count_before"),
+                    resolved_by=existing.get("resolved_by"),
+                    message="These attachments were already added by this request id or identical content (use \"force\": true to add again)",
+                )
+                _write_result(config, req_id, r)
+                _archive_request(item_path, config.archive_dir, req_id)
+                return r
+
+        target = resolve_attach_target(req.note_id, req.title, req.folder)
+        if target["status"] != "OK":
+            kw = {}
+            if target.get("candidates") is not None:
+                kw["candidates"] = target["candidates"]
+            return _fail(target.get("error", "note not found"), **kw)
+        note_id = target["note_id"]
+
+        scratch_dir = Path(f"/tmp/rich_notes_bridge_attach_{req_id}_{int(time.time() * 1000)}")
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        staged = stage_attachments(req.attachments, scratch_dir, req.auto_named)
+        added_names = [p.name for p in staged]
+
+        logger.info(f"Attach {req_id}: adding {len(staged)} attachment(s) to note {note_id} ({target['resolved_by']})")
+        try:
+            meta = execute_applescript_attach_to_note(note_id, staged)
+        except Exception as e:
+            return _fail(str(e), note_id=note_id, resolved_by=target["resolved_by"])
+
+        if meta["after"] < meta["before"] + len(staged):
+            return _fail(
+                f"Notes.app reports {meta['after']} attachment(s) after adding {len(staged)} to {meta['before']}",
+                note_id=note_id, title=meta["title"], folder=meta["folder"],
+                attachments_count=meta["after"], attachments=meta["attachment_names"],
+                attachments_count_before=meta["before"], resolved_by=target["resolved_by"],
+            )
+
+        record = {
+            "note_id": note_id,
+            "title": meta["title"],
+            "folder": meta["folder"],
+            "attachments_count": meta["after"],
+            "attachments": meta["attachment_names"],
+            "attachments_added": added_names,
+            "attachments_count_before": meta["before"],
+            "resolved_by": target["resolved_by"],
+            "content_hash": content_hash,
+            "created_at": now_iso,
+        }
+        dedup.record(dedup_id, content_hash, record)
+
+        r = _result(
+            "success",
+            note_id=note_id, title=meta["title"], folder=meta["folder"],
+            attachments_count=meta["after"], attachments=meta["attachment_names"],
+            attachments_added=added_names, attachments_count_before=meta["before"],
+            resolved_by=target["resolved_by"],
+        )
+        logger.info(f"Attach {req_id}: note '{meta['title']}' now has {meta['after']} attachment(s) (was {meta['before']})")
+        _write_result(config, req_id, r)
+        _archive_request(item_path, config.archive_dir, req_id)
+        return r
+    except Exception as e:
+        logger.error(f"Attach request {req_id} crashed: {e}", exc_info=True)
+        return _fail(str(e))
+    finally:
+        if scratch_dir and scratch_dir.exists():
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+# ----------------------------------------------------------------------
 # Request Processing Pipeline
 # ----------------------------------------------------------------------
 def process_request(item_path: Path, config: BridgeConfig, dedup: DedupManager) -> Dict[str, Any]:
@@ -1188,6 +1978,8 @@ def process_request(item_path: Path, config: BridgeConfig, dedup: DedupManager) 
     op = _detect_op(item_path, orig_name)
     if op == "export":
         return process_export_request(item_path, config)
+    if op == "attach":
+        return process_attach_request(item_path, config, dedup)
     if op != "create":
         logger.error(f"Request {req_id} has unrecognized op {op!r} — refusing to guess, erroring cleanly")
         error_result = {
@@ -1199,31 +1991,43 @@ def process_request(item_path: Path, config: BridgeConfig, dedup: DedupManager) 
             "attachments_count": 0,
             "attachments": [],
             "processed_at": now_iso,
-            "error": f"Unrecognized op {op!r} (expected \"create\" or \"export\")",
+            "error": f"Unrecognized op {op!r} (expected \"create\", \"export\" or \"attach\")",
         }
         _write_result(config, req_id, error_result)
         _archive_request(item_path, config.archive_dir / "failed", req_id)
         return error_result
 
     try:
-        req = parse_request_from_path(item_path)
-        if not req:
-            logger.warning(f"Could not parse request from {item_path.name}")
-            return {"id": req_id, "status": "skipped", "message": "Unrecognized request format"}
+        existing = None
+        try:
+            req = parse_request_from_path(item_path)
+        except AttachmentLoadError:
+            # A request id that already produced a note is a duplicate no
+            # matter what — even if its companion files have since moved
+            # (dedup by id ran before attachments mattered, and still must).
+            peek_id = _peek_request_id(item_path, req_id)
+            existing = dedup.check_duplicate(peek_id, "") if peek_id else None
+            if not existing:
+                raise
+            req_id = peek_id
+        if existing is None:
+            if not req:
+                logger.warning(f"Could not parse request from {item_path.name}")
+                return {"id": req_id, "status": "skipped", "message": "Unrecognized request format"}
 
-        req_id = req.request_id
-        content_hash = req.compute_content_hash()
+            req_id = req.request_id
+            content_hash = req.compute_content_hash()
 
-        # Check deduplication
-        existing = dedup.check_duplicate(req.request_id, content_hash)
+            # Check deduplication
+            existing = dedup.check_duplicate(req.request_id, content_hash)
         if existing:
             logger.info(f"Duplicate request detected for {req_id} (note_id: {existing.get('note_id')})")
             result = {
                 "id": req_id,
                 "status": "duplicate",
                 "note_id": existing.get("note_id"),
-                "title": existing.get("title", req.title),
-                "folder": existing.get("folder", req.folder),
+                "title": existing.get("title", req.title if req else None),
+                "folder": existing.get("folder", req.folder if req else None),
                 "attachments_count": existing.get("attachments_count", 0),
                 "attachments": existing.get("attachments", []),
                 "processed_at": now_iso,
@@ -1284,7 +2088,7 @@ def process_request(item_path: Path, config: BridgeConfig, dedup: DedupManager) 
         return result
 
     except Exception as e:
-        logger.error(f"Failed processing request {req_id}: {e}", exc_info=True)
+        logger.error(f"Failed processing request {req_id}: {e}", exc_info=not isinstance(e, AttachmentLoadError))
         error_result = {
             "id": req_id,
             "status": "error",
@@ -1751,6 +2555,316 @@ def run_self_test(config: BridgeConfig, keep_note: bool = False) -> bool:
 
 
 # ----------------------------------------------------------------------
+# Audio / Video Self Test Utility
+# ----------------------------------------------------------------------
+def _synth_sine_wav(path: Path, seconds: float = 0.6, freq: float = 440.0, rate: int = 22050):
+    """Writes a short mono 16-bit sine tone with the stdlib `wave` module."""
+    import math
+    import struct
+    import wave
+
+    n = int(seconds * rate)
+    frames = b"".join(
+        struct.pack("<h", int(12000 * math.sin(2 * math.pi * freq * i / rate))) for i in range(n)
+    )
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(frames)
+
+
+def generate_test_media(work_dir: Path) -> Dict[str, Any]:
+    """
+    Produces test media with stock tools only. Returns
+    {"audio": (name, bytes, note), "video": (name, bytes, note) | None, "video_skip": reason}.
+      audio: .m4a via `afconvert -f m4af -d aac` (stock macOS); if afconvert is
+             missing/fails, the raw .wav is used and the note says so.
+      video: no stock macOS CLI synthesizes video frames (avconvert only
+             transcodes existing assets; ffmpeg is not stock). The closest
+             stock artifact is an MPEG-4 (.mp4) container holding the AAC
+             track (`afconvert -f mp4f`), which exercises the .mp4 attachment
+             path. If that fails, the video case is skipped with the reason.
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    wav = work_dir / "bridge_tone.wav"
+    _synth_sine_wav(wav)
+    out: Dict[str, Any] = {"audio": None, "video": None, "video_skip": None}
+    afconvert = shutil.which("afconvert")
+
+    m4a = work_dir / "bridge_tone.m4a"
+    if afconvert:
+        r = subprocess.run([afconvert, "-f", "m4af", "-d", "aac", str(wav), str(m4a)], capture_output=True, text=True)
+        if r.returncode == 0 and m4a.exists() and m4a.stat().st_size > 0:
+            out["audio"] = ("bridge_tone.m4a", m4a.read_bytes(), "AAC .m4a synthesized via afconvert")
+        else:
+            logger.warning(f"afconvert → .m4a failed ({r.stderr.strip()}); falling back to .wav")
+    if out["audio"] is None:
+        out["audio"] = ("bridge_tone.wav", wav.read_bytes(),
+                        "afconvert unavailable — using stdlib-synthesized .wav instead of .m4a")
+
+    mp4 = work_dir / "bridge_tone.mp4"
+    if afconvert:
+        r = subprocess.run([afconvert, "-f", "mp4f", "-d", "aac", str(wav), str(mp4)], capture_output=True, text=True)
+        if r.returncode == 0 and mp4.exists() and mp4.stat().st_size > 0:
+            out["video"] = ("bridge_tone.mp4", mp4.read_bytes(),
+                            "audio-only MPEG-4 container (no stock tool synthesizes video frames)")
+        else:
+            out["video_skip"] = f"afconvert -f mp4f failed: {r.stderr.strip() or r.returncode}"
+    else:
+        out["video_skip"] = "afconvert not available; no stock tool can produce an .mp4"
+    return out
+
+
+def _jxa_note_attachments(note_id: str) -> Dict[str, Any]:
+    jxa = f"""
+    function run() {{
+        const Notes = Application('Notes');
+        const note = Notes.notes.byId({json.dumps(note_id)});
+        const atts = note.attachments();
+        return JSON.stringify({{
+            name: note.name(),
+            attachments_count: atts.length,
+            attachment_names: atts.map(a => a.name())
+        }});
+    }}
+    """
+    res = subprocess.run(["osascript", "-l", "JavaScript", "-"], input=jxa, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"JXA read-back failed: {res.stderr.strip()}")
+    return json.loads(res.stdout.strip())
+
+
+def _attachment_name_matches(expected: str, names: List[str]) -> bool:
+    stem = Path(expected).stem
+    return any(n == expected or Path(n).stem == stem for n in (names or []))
+
+
+def _drop_request_and_wait(config: BridgeConfig, dedup: DedupManager, req_id: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    drop = config.inbox_dir / f"{req_id}.json"
+    result_path = config.outbox_dir / f"{req_id}.json"
+    if result_path.exists():
+        result_path.unlink()
+    with open(drop, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    time.sleep(0.3)
+    scan_and_process_inbox(config, dedup)
+    for _ in range(20):
+        if result_path.exists():
+            break
+        time.sleep(0.3)
+    if not result_path.exists():
+        return None
+    with open(result_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def run_media_self_test(config: BridgeConfig, keep_note: bool = False) -> bool:
+    """
+    Creates one note per media case (audio .m4a — or .wav fallback — and
+    .mp4 when producible), each with base64 attachment data, and verifies via
+    JXA that attachments_count >= 1 and the attachment name matches. Also
+    checks magic-byte detection of each generated file so an unnamed blob of
+    that type would be labeled correctly. Missing .mp4 → logged skip, not fail.
+    """
+    logger.info("Starting audio/video attachment self test...")
+    config.ensure_directories()
+    dedup = DedupManager(config.dedup_file)
+    work = Path(f"/tmp/rich_notes_bridge_media_test_{int(time.time() * 1000)}")
+    created: List[str] = []
+    ok = True
+    try:
+        media = generate_test_media(work)
+        cases = [("audio", media["audio"])]
+        if media["video"]:
+            cases.append(("video", media["video"]))
+        else:
+            logger.warning(f"Video case SKIPPED: {media['video_skip']}")
+
+        for kind, (fname, data, note) in cases:
+            logger.info(f"[{kind}] {fname} ({len(data):,} bytes) — {note}")
+            detected = detect_file_extension(data)
+            if detected != Path(fname).suffix:
+                logger.error(f"[{kind}] FAIL: magic-byte detection gave {detected}, expected {Path(fname).suffix}")
+                ok = False
+            rid = f"test-media-{kind}-{int(time.time() * 1000)}"
+            payload = {
+                "id": rid,
+                "title": f"Rich Bridge {kind.title()} Test ({rid})",
+                "folder": "Notes",
+                "body": f"Self-test {kind} attachment: **{fname}** — {note}",
+                "attachments": {fname: base64.b64encode(data).decode("ascii")},
+            }
+            result = _drop_request_and_wait(config, dedup, rid, payload)
+            if not result or result.get("status") != "success":
+                logger.error(f"[{kind}] FAIL: result {result}")
+                ok = False
+                continue
+            created.append(result["note_id"])
+            if result.get("attachments_count") != 1 or result.get("attachments") != [fname]:
+                logger.error(f"[{kind}] FAIL: receipt attachments {result.get('attachments')} (count {result.get('attachments_count')})")
+                ok = False
+            info = _jxa_note_attachments(result["note_id"])
+            logger.info(f"[{kind}] Notes.app confirmation: {info}")
+            if info.get("attachments_count", 0) < 1 or not _attachment_name_matches(fname, info.get("attachment_names")):
+                logger.error(f"[{kind}] FAIL: Notes.app shows {info}")
+                ok = False
+            else:
+                logger.info(f"[{kind}] PASS")
+    except Exception as e:
+        logger.error(f"Media self test crashed: {e}", exc_info=True)
+        ok = False
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        if not keep_note:
+            for nid in created:
+                subprocess.run(
+                    ["osascript", "-e", f'tell application "Notes" to delete note id "{_escape_applescript_string(nid)}"'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+    logger.info("✅ Media self test PASSED" if ok else "❌ Media self test FAILED")
+    return ok
+
+
+# ----------------------------------------------------------------------
+# Offline unit tests (no Notes.app / osascript needed; run anywhere)
+# ----------------------------------------------------------------------
+def run_unit_tests() -> bool:
+    import tempfile
+
+    failures: List[str] = []
+
+    def check(cond: bool, label: str):
+        (logger.info if cond else logger.error)(f"{'PASS' if cond else 'FAIL'}: {label}")
+        if not cond:
+            failures.append(label)
+
+    # Fix 1 — detection
+    cases = {
+        b"\x00\x00\x00\x20ftypM4A \x00\x00\x00\x00M4A mp42isom": ".m4a",
+        b"\x00\x00\x00\x18ftypM4B \x00\x00\x00\x00": ".m4a",
+        b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00": ".mov",
+        b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00": ".heic",
+        b"\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00": ".heic",
+        b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00": ".mp4",
+        b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00": ".mp4",
+        b"\x00\x00\x00\x18ftypdash\x00\x00\x00\x00": ".mp4",
+        b"\x00\x00\x00\x18ftypXXXX\x00\x00\x00\x00M4A ": ".m4a",  # compat brand
+        b"ID3\x04\x00\x00\x00\x00\x00\x00": ".mp3",
+        b"\xff\xfb\x90\x64\x00": ".mp3",
+        b"\xff\xf1\x50\x80": ".aac",
+        b"RIFF\x24\x00\x00\x00WAVEfmt ": ".wav",
+        b"RIFF\x24\x00\x00\x00WEBPVP8 ": ".webp",
+        b"fLaC\x00\x00\x00\x22": ".flac",
+        b"OggS\x00\x02": ".ogg",
+        b"\x89PNG\r\n\x1a\n....": ".png",
+        b"\xff\xd8\xff\xe0JFIF": ".jpg",
+        b"PK\x03\x04....": ".zip",
+        b"%PDF-1.7": ".pdf",
+        b"\x00\x01\x02\x03random": ".bin",
+    }
+    for blob, want in cases.items():
+        check(detect_file_extension(blob) == want, f"detect {blob[:12]!r} -> {want} (got {detect_file_extension(blob)})")
+    with tempfile.TemporaryDirectory() as td:
+        wav = Path(td) / "t.wav"
+        _synth_sine_wav(wav, seconds=0.05)
+        check(detect_file_extension(wav.read_bytes()) == ".wav", "stdlib wave output detected as .wav")
+    # Named file wins over magic bytes (docx is a ZIP container)
+    check(staged_attachment_name("report.docx", b"PK\x03\x04") == "report.docx", "sender filename .docx not relabeled .zip")
+    check(staged_attachment_name("voice", b"\x00\x00\x00\x18ftypM4A \x00") == "voice.m4a", "extensionless name gets detected .m4a")
+    check(staged_attachment_name("attachment_1.png", b"ID3....", auto=True) == "attachment_1.mp3", "auto placeholder name re-detected")
+    check(staged_attachment_name("attachment_1.png", b"ID3", hint="clip.mp3", auto=True) == "clip.mp3", "auto name uses path hint")
+
+    # Fix 2 — strict decode / never drop
+    good = base64.b64encode(b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 64).decode()
+    check(decode_base64_string(good)[4:8] == b"ftyp", "valid base64 decodes")
+    check(decode_base64_string(good.rstrip("=")) == decode_base64_string(good), "unpadded base64 accepted")
+    for bad in ["clips/stoats.m4a", "not base64!!", "abcd*efgh"]:
+        try:
+            decode_base64_string(bad)
+            check(False, f"strict decode rejects {bad!r}")
+        except ValueError:
+            check(True, f"strict decode rejects {bad!r}")
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        (base / "real.m4a").write_bytes(b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00")
+        out: Dict[str, bytes] = {}
+        _extract_attachments({"real.m4a": "real.m4a", "inline.m4a": good}, out, base)
+        check(set(out) == {"real.m4a", "inline.m4a"}, "dict entries: file path + inline base64 both load")
+        for label, obj in [
+            ("dict missing path", {"x.m4a": "missing/x.m4a"}),
+            ("dict dotless missing path", {"x": "clips/audio"}),
+            ("dict garbage", {"x.m4a": "%%%%not-base64%%%%%%%%%%%%"}),
+            ("dict empty value", {"x.m4a": ""}),
+            ("list item no data", [{"name": "x.m4a"}]),
+            ("list item missing path", [{"name": "x.m4a", "path": "nope.m4a"}]),
+            ("list bare missing path", ["nope.m4a"]),
+        ]:
+            try:
+                _extract_attachments(obj, {}, base)
+                check(False, f"{label} raises AttachmentLoadError")
+            except AttachmentLoadError as e:
+                check("x.m4a" in str(e) or "nope.m4a" in str(e) or "clips/audio" in str(e) or "'x'" in str(e),
+                      f"{label} raises AttachmentLoadError naming the entry ({e})")
+        # JPEG base64 starts with "/9j/" — must not be mistaken for a path.
+        jpg_b64 = base64.b64encode(b"\xff\xd8\xff\xe0" + b"\x00" * 40).decode()
+        o2: Dict[str, bytes] = {}
+        _extract_attachments({"p.jpg": jpg_b64}, o2, base)
+        check(o2["p.jpg"][:3] == b"\xff\xd8\xff", "JPEG base64 starting '/9j/' still decodes")
+
+        # Staging collision: two entries with the same basename both survive.
+        sd = base / "stage"
+        sd.mkdir()
+        staged = stage_attachments({"a/x.png": b"\x89PNG\r\n\x1a\n1", "b/x.png": b"\x89PNG\r\n\x1a\n2"}, sd)
+        check(len(staged) == 2 and len({p.name for p in staged}) == 2, f"colliding names both staged ({[p.name for p in staged]})")
+
+        # End-to-end through process_request (fails before any osascript call).
+        cfg = BridgeConfig(base / "bridge")
+        cfg.ensure_directories()
+        dd = DedupManager(cfg.dedup_file)
+        (cfg.inbox_dir / "missing-att.json").write_text(json.dumps(
+            {"id": "missing-att", "title": "T", "attachments": {"ghost.m4a": "ghost.m4a"}}))
+        r = process_request(cfg.inbox_dir / "missing-att.json", cfg, dd)
+        check(r["status"] == "error" and "ghost.m4a" in (r.get("error") or "") and r["note_id"] is None,
+              f"missing attachment → error naming file, no note ({r.get('error')})")
+        rr = json.loads((cfg.outbox_dir / "missing-att.json").read_text())
+        check(rr["status"] == "error" and rr["attachments"] == [], "outbox receipt is error with empty attachments list")
+
+        # Dedup by id still wins even if the companion file has since vanished.
+        dd.record("old-req", "deadbeef", {"note_id": "x-coredata://S/ICNote/p1", "title": "Old",
+                                         "folder": "Notes", "attachments_count": 1, "attachments": ["a.m4a"]})
+        (cfg.inbox_dir / "old-req.json").write_text(json.dumps(
+            {"id": "old-req", "title": "Old", "attachments": {"a.m4a": "gone/a.m4a"}}))
+        r = process_request(cfg.inbox_dir / "old-req.json", cfg, dd)
+        check(r["status"] == "duplicate", f"re-dropped id with moved file → duplicate (got {r['status']})")
+
+        # attach op: unloadable attachment → error before any Notes call.
+        (cfg.inbox_dir / "att-bad.json").write_text(json.dumps(
+            {"op": "attach", "id": "att-bad", "note_id": "x-coredata://S/ICNote/p1", "attachments": {"q.m4a": "nope/q.m4a"}}))
+        r = process_request(cfg.inbox_dir / "att-bad.json", cfg, dd)
+        check(r["status"] == "error" and r["op"] == "attach" and "q.m4a" in r["error"], f"attach with missing file → error ({r['error']})")
+        (cfg.inbox_dir / "att-none.json").write_text(json.dumps({"op": "attach", "id": "att-none", "note_id": "x"}))
+        r = process_request(cfg.inbox_dir / "att-none.json", cfg, dd)
+        check(r["status"] == "error", "attach with no attachments → error")
+
+        # Content hash of a legacy manifest is unchanged by the new parsing.
+        (cfg.inbox_dir / "legacy.json").write_text(json.dumps(
+            {"id": "legacy", "title": "L", "body": "b", "images": [{"data": good}]}))
+        req = parse_request_from_path(cfg.inbox_dir / "legacy.json")
+        h = hashlib.sha256()
+        for part in (b"Notes", b"|", b"L", b"|", b"b", b"|att:", b"attachment_1.png", b":",
+                     hashlib.sha256(decode_base64_string(good)).digest()):
+            h.update(part)
+        check(req.compute_content_hash() == h.hexdigest(), "legacy unnamed-list manifest keeps its content hash")
+        check(staged_attachment_name("attachment_1.png", req.attachments["attachment_1.png"],
+                                     auto=True) == "attachment_1.m4a", "…but stages with its real .m4a extension")
+
+    logger.info(f"Unit tests: {'ALL PASSED' if not failures else f'{len(failures)} FAILED'}")
+    return not failures
+
+
+# ----------------------------------------------------------------------
 # Export Self Test Utility
 # ----------------------------------------------------------------------
 def _get_plaintext_directly_for_test(note_id: str) -> str:
@@ -2043,8 +3157,9 @@ def main():
     subparsers.add_parser("uninstall", parents=[base_parser], help="Unload and remove launchd service")
     subparsers.add_parser("status", parents=[base_parser], help="Show bridge status and pending queue")
 
-    test_parser = subparsers.add_parser("test", parents=[base_parser], help="Run end-to-end self tests (image attachment + export round trip)")
+    test_parser = subparsers.add_parser("test", parents=[base_parser], help="Run end-to-end self tests (image + audio/video attachments + export round trip)")
     test_parser.add_argument("--keep", action="store_true", help="Keep the created test note in Notes.app")
+    subparsers.add_parser("unit-test", parents=[base_parser], help="Run offline unit tests (no Notes.app needed)")
 
     args = parser.parse_args()
     config = BridgeConfig(getattr(args, "dir", DEFAULT_BASE_DIR))
@@ -2065,16 +3180,23 @@ def main():
     elif args.command == "status":
         check_status(config)
     elif args.command == "test":
+        unit_passed = run_unit_tests()
         image_test_passed = run_self_test(config, keep_note=args.keep)
+        media_test_passed = run_media_self_test(config, keep_note=args.keep)
         export_test_passed = run_export_self_test(config, keep_note=args.keep)
-        if image_test_passed and export_test_passed:
-            logger.info("✅ ALL self tests passed (image attachment test + export round-trip test).")
+        all_ok = unit_passed and image_test_passed and media_test_passed and export_test_passed
+        if all_ok:
+            logger.info("✅ ALL self tests passed (unit + image + audio/video + export round-trip).")
         else:
             logger.error(
-                f"Self test suite FAILED — image test: {'PASS' if image_test_passed else 'FAIL'}, "
-                f"export test: {'PASS' if export_test_passed else 'FAIL'}"
+                f"Self test suite FAILED — unit: {'PASS' if unit_passed else 'FAIL'}, "
+                f"image: {'PASS' if image_test_passed else 'FAIL'}, "
+                f"audio/video: {'PASS' if media_test_passed else 'FAIL'}, "
+                f"export: {'PASS' if export_test_passed else 'FAIL'}"
             )
-        sys.exit(0 if (image_test_passed and export_test_passed) else 1)
+        sys.exit(0 if all_ok else 1)
+    elif args.command == "unit-test":
+        sys.exit(0 if run_unit_tests() else 1)
     else:
         parser.print_help()
 

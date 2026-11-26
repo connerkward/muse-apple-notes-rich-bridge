@@ -23,7 +23,7 @@ By default, the bridge operates at `~/.rich-notes-bridge/`:
 
 ## 2. Request Protocols (Drop Formats)
 
-Muse can submit requests in any of the following 3 formats. Choose whichever is easiest for your transport channel. All three formats are for **creating** a note (the implicit `"op": "create"`); reading an existing note back out is a distinct request shape — see [§6, Export Protocol](#6-export-protocol-read-an-existing-note-read-only).
+Muse can submit requests in any of the following 3 formats. Choose whichever is easiest for your transport channel. All three formats are for **creating** a note (the implicit `"op": "create"`); reading an existing note back out is a distinct request shape — see [§8, Export Protocol](#8-export-protocol-read-an-existing-note-read-only).
 
 ### Format A: Single JSON File Drop (Recommended)
 
@@ -175,9 +175,67 @@ If the same request ID or identical content is received again:
 }
 ```
 
+### Attachment Loading Rules (all ops that take `images` / `attachments`)
+
+* Each entry is either a file path (relative to the manifest; absolute and `~` also accepted) or inline base64 / `data:` URI. Base64 is decoded **strictly** (URL-safe alphabet and missing padding are accepted; any other non-alphabet character is an error).
+* **Any referenced-but-unloadable entry is a hard failure**: missing file, unreadable file, empty value, undecodable base64. The receipt is `"status": "error"` with an `error` naming the entry (e.g. `Attachment attachments['clip.m4a']: file not found: 'clips/clip.m4a' …`) and **no note is created or modified**. A request never "succeeds" with fewer attachments than it asked for.
+* `attachments` in every success receipt lists the filenames actually attached — compare it (and `attachments_count`) to what you sent.
+* A sender-supplied filename extension always wins. Detection by magic bytes only applies to extensionless / `.b64` / `.txt` names and to unnamed list entries. Detected: PNG, JPEG, GIF, WebP, TIFF, BMP, PDF, ZIP, HEIC, M4A, MP4, MOV, MP3, AAC (ADTS), WAV, AVI, FLAC, OGG. Unknown → `.bin` (never mislabeled as an image). ZIP-container documents (.docx/.xlsx/.pages) are indistinguishable from .zip by content — **always send the real filename**.
+* Two entries that stage to the same filename get a ` (2)` suffix instead of one overwriting the other.
+
 ---
 
-## 6. Export Protocol (Read an Existing Note, Read-Only)
+## 7. Attach Protocol (Add Attachments to an Existing Note)
+
+Appends files to a note that already exists — e.g. to repair a note created without its media. Single JSON file (`inbox/<id>.json`) or a directory whose `manifest.json` contains `"op": "attach"` (paths then resolve relative to that directory).
+
+```json
+{
+  "id": "attach-stoats-audio-20261126",
+  "op": "attach",
+  "note_id": "x-coredata://XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX/ICNote/p9450",
+  "title": "THE FORM — @stoats__ (audio)",
+  "folder": "Notes",
+  "attachments": {"stoats.m4a": "<base64 or relative path>"}
+}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `op` | Yes | `"attach"` |
+| `note_id` | One of `note_id` / `title` | `x-coredata://…` id (from any receipt), or the note's UUID identifier (`applenotes:note/<UUID>` form also accepted; mapped via the local Notes SQLite store, which needs Full Disk Access for the bridge's python — otherwise it falls back to `title`). |
+| `title` (+ `folder`) | Fallback | Exact title match, restricted to folders named `folder` when given. Must match **exactly one** note, otherwise error with `candidates`. |
+| `images` / `attachments` | Yes | Same formats and loading rules as create. |
+| `force` | No | `true` bypasses attach dedup (see below). |
+
+Attachments are added with the same native handler as create and land at the **end** of the note. Before touching Notes.app every attachment is loaded and validated; the request errors with the note untouched if any fails.
+
+Receipt (additive to the create schema; `attachments_count` is the note's **new total**):
+```json
+{
+  "id": "attach-stoats-audio-20261126",
+  "status": "success",
+  "op": "attach",
+  "note_id": "x-coredata://…/ICNote/p9450",
+  "title": "THE FORM — @stoats__ (audio)",
+  "folder": "Notes",
+  "attachments_count": 1,
+  "attachments": ["stoats.m4a"],
+  "attachments_added": ["stoats.m4a"],
+  "attachments_added_count": 1,
+  "attachments_count_before": 0,
+  "resolved_by": "note_id",
+  "processed_at": "…",
+  "error": null
+}
+```
+`resolved_by` is `note_id`, `note_uuid`, `title_folder` or `title`. If Notes refuses a file midway, the error says how many were already added (those are not rolled back).
+
+**Dedup:** attach requests are recorded under a separate `attach:` namespace (never colliding with create). Re-dropping the same `id`, or the same target + identical attachment bytes, returns `"status": "duplicate"` without adding anything again. Send `"force": true` to append anyway.
+
+---
+
+## 8. Export Protocol (Read an Existing Note, Read-Only)
 
 Some external connectors have their own Apple Notes integration that caps a single read at 64 KiB — real notes routinely exceed that (a ~125 KB note is the motivating case for this feature). Export closes that gap using the bridge's own, already-granted Notes automation access: it reads a note's full body and writes it out as plain files in the outbox, which the consumer reads via file transfer instead of through the connector's truncating read path.
 
@@ -199,7 +257,7 @@ Export is **only** supported via a single JSON file in `inbox/<request_id>.json`
 | Field | Required | Notes |
 |---|---|---|
 | `id` | Yes | Export request id. Used for both the output filenames and the receipt filename. |
-| `op` | Yes | Must be the literal string `"export"`. (Absent or `"create"` → the normal create pipeline, unaffected by any of this. Any other value → a clean `"status": "error"` receipt — never silently treated as a create.) |
+| `op` | Yes | Must be the literal string `"export"`. (Absent or `"create"` → the normal create pipeline, unaffected by any of this. `"attach"` → §7. Any other value → a clean `"status": "error"` receipt — never silently treated as a create.) |
 | `note_id` | One of `note_id` / `title` | The `x-coredata://...` id form already returned in every create/export receipt's `note_id` field. Takes priority over `title` when both are present. |
 | `title` | One of `note_id` / `title` | Exact-match lookup, used only when `note_id` is `null`/absent. Zero matches or more than one match both error out — the bridge never guesses which note you meant. |
 
