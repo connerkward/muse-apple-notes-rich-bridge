@@ -1,6 +1,6 @@
 ![Rich Notes Bridge — let any external agent write real Apple Notes with native attachments](assets/banner.png)
 
-# Rich Notes Bridge
+# Rich Notes Bridge for Meta Muse Desktop
 
 **A companion bridge built for Muse** — it exists specifically to work around the limits of Muse's own built-in Apple Notes integration on macOS. Muse (and in principle any other external agent operating over a paired-device text channel) talks to this bridge through a local inbox/outbox folder pair instead of through its own Notes connector.
 
