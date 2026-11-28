@@ -182,6 +182,14 @@ If the same request ID or identical content is received again:
 * `attachments` in every success receipt lists the filenames actually attached — compare it (and `attachments_count`) to what you sent.
 * A sender-supplied filename extension always wins. Detection by magic bytes only applies to extensionless / `.b64` / `.txt` names and to unnamed list entries. Detected: PNG, JPEG, GIF, WebP, TIFF, BMP, PDF, ZIP, HEIC, M4A, MP4, MOV, MP3, AAC (ADTS), WAV, AVI, FLAC, OGG. Unknown → `.bin` (never mislabeled as an image). ZIP-container documents (.docx/.xlsx/.pages) are indistinguishable from .zip by content — **always send the real filename**.
 * Two entries that stage to the same filename get a ` (2)` suffix instead of one overwriting the other.
+* Unnamed ZIP blobs are classified from their central directory: `word/` → `.docx`, `xl/` → `.xlsx`, `ppt/` → `.pptx`, `Index/Document.iwa` → `.pages` (also `.key`, `.numbers`, `.epub`); otherwise `.zip`.
+* Single-attachment aliases `audio_attachment`, `video_attachment`, `image_attachment`, `attachment` are accepted (string = one path or base64; object/list = same shapes as `attachments`). A string path keeps its basename as the filename. Any other top-level key that looks like an attachment reference (`*attach*`, `*audio*`, `*video*`, `*file*`, …) is **logged as a warning and not processed** — use `attachments`.
+
+### Limits and unsupported content
+
+* **Size:** attachments travel as base64 inside JSON and are fully decoded in memory (~1.33× the file on the wire, plus decode). That's fine for a short audio clip (an 81-second .m4a is ~1.3 MB), but not workable for video of any real length. There is no size guard and no streaming path in this version. For large files, put them next to a directory-drop manifest and reference them by path rather than inlining base64.
+* **Document scans and Pencil drawings/handwriting** are not reachable: Notes' AppleScript only creates generic file attachments. A scan or drawing can be attached as an image/PDF file, but not as a native scan or drawing object.
+* **Placement:** attachments always append at the end of the note (see the comment in `prepare_note_html_and_attachments`).
 
 ---
 

@@ -179,6 +179,41 @@ def _detect_ftyp_extension(data: bytes) -> Optional[str]:
     return None
 
 
+def _detect_zip_container_extension(data: bytes) -> str:
+    """
+    Office Open XML / iWork / EPUB are all ZIP containers. For UNNAMED blobs
+    only, read the ZIP central directory (stdlib zipfile, no extraction) and
+    infer the document type from its entry names; else ".zip".
+    """
+    import io
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = zf.namelist()
+            if "mimetype" in names:
+                try:
+                    if zf.read("mimetype").strip() == b"application/epub+zip":
+                        return ".epub"
+                except Exception:
+                    pass
+    except Exception:
+        return ".zip"
+    if any(n.startswith("word/") for n in names):
+        return ".docx"
+    if any(n.startswith("xl/") for n in names):
+        return ".xlsx"
+    if any(n.startswith("ppt/") for n in names):
+        return ".pptx"
+    if "Index/Document.iwa" in names:
+        return ".pages"
+    if "Index/Presentation.iwa" in names:
+        return ".key"
+    if "Index/CalculationEngine.iwa" in names:
+        return ".numbers"
+    return ".zip"
+
+
 def detect_file_extension(data: bytes, fallback: str = ".bin") -> str:
     """
     Detect file extension from magic bytes for common media and docs.
@@ -209,7 +244,7 @@ def detect_file_extension(data: bytes, fallback: str = ".bin") -> str:
     if data.startswith(b"%PDF"):
         return ".pdf"
     if data.startswith(b"PK\x03\x04"):
-        return ".zip"
+        return _detect_zip_container_extension(data)
     if data.startswith(b"MM\x00*") or data.startswith(b"II*\x00"):
         return ".tiff"
     if data.startswith(b"fLaC"):
@@ -628,9 +663,7 @@ def _parse_attach_request(item_path: Path) -> AttachRequest:
     req_id = meta.get("id") or (orig_name if item_path.is_dir() else Path(orig_name).stem)
     attachments: Dict[str, bytes] = {}
     auto_named: Dict[str, Optional[str]] = {}
-    for k in ["images", "attachments"]:
-        if k in meta:
-            _extract_attachments(meta[k], attachments, base_dir, key=k, auto_named=auto_named)
+    collect_manifest_attachments(meta, attachments, base_dir, auto_named, req_label=str(req_id))
 
     return AttachRequest(
         request_id=req_id,
@@ -723,9 +756,7 @@ def _parse_directory_request(dir_path: Path) -> RichNoteRequest:
         body = meta.get("body", "")
         format_type = meta.get("format", "auto")
 
-        for k in ["images", "attachments"]:
-            if k in meta:
-                _extract_attachments(meta[k], attachments, dir_path, key=k, auto_named=auto_named)
+        collect_manifest_attachments(meta, attachments, dir_path, auto_named, req_label=str(req_id))
 
     elif manifest_path:
         with open(manifest_path, "r", encoding="utf-8") as f:
@@ -792,9 +823,7 @@ def _parse_json_file_request(json_path: Path) -> RichNoteRequest:
     attachments: Dict[str, bytes] = {}
     auto_named: Dict[str, Optional[str]] = {}
 
-    for k in ["images", "attachments"]:
-        if k in meta:
-            _extract_attachments(meta[k], attachments, json_path.parent, key=k, auto_named=auto_named)
+    collect_manifest_attachments(meta, attachments, json_path.parent, auto_named, req_label=str(req_id))
 
     req = RichNoteRequest(
         request_id=req_id,
@@ -912,6 +941,60 @@ def _load_attachment_value(name: str, val: Any, base_dir: Path, key: str) -> byt
     if not data:
         raise AttachmentLoadError(f"Attachment {label}: base64 decoded to zero bytes")
     return data
+
+
+# Single-attachment aliases accepted alongside the canonical images/attachments.
+# "audio_attachment" is the form an existing sender already used; ignoring it
+# is how an 81-second .m4a was silently never attached.
+ATTACHMENT_ALIAS_KEYS = ("audio_attachment", "video_attachment", "image_attachment", "attachment")
+_KNOWN_MANIFEST_KEYS = {
+    "id", "op", "title", "folder", "body", "format", "images", "attachments",
+    "note_id", "force", *ATTACHMENT_ALIAS_KEYS,
+}
+_ATTACHMENTISH_KEY_RE = re.compile(r"attach|audio|video|image|photo|picture|media|file|clip|voice|recording", re.I)
+
+
+def collect_manifest_attachments(
+    meta: Dict[str, Any],
+    out_dict: Dict[str, bytes],
+    base_dir: Path,
+    auto_named: Dict[str, Optional[str]],
+    req_label: str = "",
+):
+    """
+    Loads every attachment a manifest references: canonical "images" /
+    "attachments", then the alias keys (string = one path/base64; dict/list =
+    same shapes as "attachments"). Unknown top-level keys that look like
+    attachment references are WARNED about in the daemon log — never silently
+    ignored. Load failures raise AttachmentLoadError.
+
+    Alias keys only contribute to the content hash when present, so manifests
+    without them hash exactly as before.
+    """
+    for k in ["images", "attachments"]:
+        if k in meta:
+            _extract_attachments(meta[k], out_dict, base_dir, key=k, auto_named=auto_named)
+    for k in ATTACHMENT_ALIAS_KEYS:
+        if k not in meta or meta[k] in (None, "", [], {}):
+            continue
+        val = meta[k]
+        if isinstance(val, str):
+            compact = re.sub(r"\s+", "", val)
+            if _PATHLIKE_RE.search(compact) and len(compact) < 4096:
+                name = Path(val.strip()).name
+            else:
+                name = f"{k}_1"  # extensionless → staged with its sniffed type
+            if name in out_dict:
+                raise AttachmentLoadError(f"{k}: filename {name!r} duplicates another attachment entry")
+            out_dict[name] = _load_attachment_value(name, val, base_dir, k)
+        else:
+            _extract_attachments(val, out_dict, base_dir, key=k, auto_named=auto_named)
+    for k in meta:
+        if k not in _KNOWN_MANIFEST_KEYS and _ATTACHMENTISH_KEY_RE.search(str(k)):
+            logger.warning(
+                f"Request {req_label}: unknown manifest key {k!r} looks like an attachment reference "
+                f"and is NOT processed — use \"attachments\" (accepted aliases: {', '.join(ATTACHMENT_ALIAS_KEYS)})"
+            )
 
 
 def _extract_attachments(
@@ -2574,6 +2657,22 @@ def _synth_sine_wav(path: Path, seconds: float = 0.6, freq: float = 440.0, rate:
         w.writeframes(frames)
 
 
+def _synth_silent_mp3(seconds: float = 1.0) -> bytes:
+    """
+    Stdlib-only MP3: no stock macOS tool ENCODES MP3 (afconvert decodes it
+    only), so this writes valid MPEG-1 Layer III frames directly — 128 kbps,
+    44.1 kHz, mono, no CRC. With all-zero side info (main_data_begin = 0,
+    part2_3_length = 0 for every granule) each frame decodes to digital
+    silence; 417-byte frames (144 * 128000 / 44100, no padding) at ~38.28
+    frames/s. Prefixed with a minimal empty ID3v2.4 tag.
+    """
+    header = bytes([0xFF, 0xFB, 0x90, 0xC0])  # sync|MPEG1|LIII|noCRC, 128k|44.1k|nopad, mono
+    frame = header + b"\x00" * (417 - len(header))
+    n_frames = max(1, int(seconds * 44100 / 1152))
+    id3 = b"ID3\x04\x00\x00\x00\x00\x00\x00"
+    return id3 + frame * n_frames
+
+
 def generate_test_media(work_dir: Path) -> Dict[str, Any]:
     """
     Produces test media with stock tools only. Returns
@@ -2590,6 +2689,8 @@ def generate_test_media(work_dir: Path) -> Dict[str, Any]:
     wav = work_dir / "bridge_tone.wav"
     _synth_sine_wav(wav)
     out: Dict[str, Any] = {"audio": None, "video": None, "video_skip": None}
+    out["mp3"] = ("bridge_silence.mp3", _synth_silent_mp3(),
+                  "1 s silent MPEG-1 Layer III, hand-built frames (no stock MP3 encoder)")
     afconvert = shutil.which("afconvert")
 
     m4a = work_dir / "bridge_tone.m4a"
@@ -2661,8 +2762,8 @@ def _drop_request_and_wait(config: BridgeConfig, dedup: DedupManager, req_id: st
 
 def run_media_self_test(config: BridgeConfig, keep_note: bool = False) -> bool:
     """
-    Creates one note per media case (audio .m4a — or .wav fallback — and
-    .mp4 when producible), each with base64 attachment data, and verifies via
+    Creates one note per media case (audio .m4a — or .wav fallback —,
+    hand-built silent .mp3, and .mp4 when producible), each with base64 attachment data, and verifies via
     JXA that attachments_count >= 1 and the attachment name matches. Also
     checks magic-byte detection of each generated file so an unnamed blob of
     that type would be labeled correctly. Missing .mp4 → logged skip, not fail.
@@ -2675,7 +2776,7 @@ def run_media_self_test(config: BridgeConfig, keep_note: bool = False) -> bool:
     ok = True
     try:
         media = generate_test_media(work)
-        cases = [("audio", media["audio"])]
+        cases = [("audio", media["audio"]), ("mp3", media["mp3"])]
         if media["video"]:
             cases.append(("video", media["video"]))
         else:
@@ -2706,10 +2807,17 @@ def run_media_self_test(config: BridgeConfig, keep_note: bool = False) -> bool:
                 ok = False
             info = _jxa_note_attachments(result["note_id"])
             logger.info(f"[{kind}] Notes.app confirmation: {info}")
-            if info.get("attachments_count", 0) < 1 or not _attachment_name_matches(fname, info.get("attachment_names")):
+            # Type check: Notes' scripting dictionary exposes no UTI/MIME for an
+            # attachment, so the attachment NAME (incl. extension) is the type
+            # signal available here. Playback cannot be scripted — run with
+            # --keep and open the notes to confirm audio/video plays.
+            names = info.get("attachment_names") or []
+            if info.get("attachments_count", 0) < 1 or not _attachment_name_matches(fname, names):
                 logger.error(f"[{kind}] FAIL: Notes.app shows {info}")
                 ok = False
             else:
+                if not any(n.lower().endswith(Path(fname).suffix) for n in names):
+                    logger.warning(f"[{kind}] Notes.app attachment name lacks extension {Path(fname).suffix}: {names}")
                 logger.info(f"[{kind}] PASS")
     except Exception as e:
         logger.error(f"Media self test crashed: {e}", exc_info=True)
@@ -2765,6 +2873,18 @@ def run_unit_tests() -> bool:
     }
     for blob, want in cases.items():
         check(detect_file_extension(blob) == want, f"detect {blob[:12]!r} -> {want} (got {detect_file_extension(blob)})")
+    check(detect_file_extension(_synth_silent_mp3(0.1)) == ".mp3", "synthesized silent MP3 detected as .mp3")
+    import io as _io
+    import zipfile as _zf
+    for entry, want in [("word/document.xml", ".docx"), ("xl/workbook.xml", ".xlsx"),
+                        ("ppt/presentation.xml", ".pptx"), ("Index/Document.iwa", ".pages"), ("readme.txt", ".zip")]:
+        bio = _io.BytesIO()
+        with _zf.ZipFile(bio, "w") as z:
+            z.writestr("[Content_Types].xml", "<Types/>")
+            z.writestr(entry, "x")
+        got = detect_file_extension(bio.getvalue())
+        check(got == want, f"unnamed ZIP with {entry} -> {want} (got {got})")
+        check(staged_attachment_name("report" + want, bio.getvalue()) == "report" + want, f"explicit name report{want} kept")
     with tempfile.TemporaryDirectory() as td:
         wav = Path(td) / "t.wav"
         _synth_sine_wav(wav, seconds=0.05)
@@ -2847,6 +2967,21 @@ def run_unit_tests() -> bool:
         (cfg.inbox_dir / "att-none.json").write_text(json.dumps({"op": "attach", "id": "att-none", "note_id": "x"}))
         r = process_request(cfg.inbox_dir / "att-none.json", cfg, dd)
         check(r["status"] == "error", "attach with no attachments → error")
+
+        # Legacy "audio_attachment" alias attaches instead of being ignored.
+        (cfg.inbox_dir / "stoats-the-form-audio.m4a").write_bytes(b"\x00\x00\x00\x1cftypM4A \x00\x00\x00\x00M4A mp42isom")
+        (cfg.inbox_dir / "alias.json").write_text(json.dumps(
+            {"id": "alias", "title": "A", "audio_attachment": "stoats-the-form-audio.m4a", "voice_memo": "x.m4a"}))
+        req = parse_request_from_path(cfg.inbox_dir / "alias.json")
+        check(list(req.attachments) == ["stoats-the-form-audio.m4a"], f"audio_attachment alias loaded ({list(req.attachments)})")
+        (cfg.inbox_dir / "alias-missing.json").write_text(json.dumps(
+            {"id": "alias-missing", "title": "A", "audio_attachment": "elsewhere/stoats.m4a"}))
+        r = process_request(cfg.inbox_dir / "alias-missing.json", cfg, dd)
+        check(r["status"] == "error" and "stoats.m4a" in r["error"], "audio_attachment with missing file → error, not silent")
+        (cfg.inbox_dir / "alias-b64.json").write_text(json.dumps({"id": "alias-b64", "title": "A", "audio_attachment": good}))
+        req = parse_request_from_path(cfg.inbox_dir / "alias-b64.json")
+        sn = staged_attachment_name("audio_attachment_1", req.attachments["audio_attachment_1"])
+        check(sn == "audio_attachment_1.m4a", f"audio_attachment base64 staged with sniffed type ({sn})")
 
         # Content hash of a legacy manifest is unchanged by the new parsing.
         (cfg.inbox_dir / "legacy.json").write_text(json.dumps(
